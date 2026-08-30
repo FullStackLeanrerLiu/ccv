@@ -32,8 +32,8 @@ template void run_mha_fwd_splitkv_dispatch<{DTYPE}, {HEAD_DIM}>(Flash_fwd_params
 KERNEL_IMPL_TEMPLATE_BWD = """#include "flash_bwd_launch_template.h"
 
 template<>
-void run_mha_bwd_<{DTYPE}, {HEAD_DIM}>(Flash_bwd_params &params, cudaStream_t stream, const bool configure) {{
-    run_mha_bwd_hdim{HEAD_DIM}<{DTYPE}>(params, stream, configure);
+void run_mha_bwd_<{DTYPE}, {HEAD_DIM}>(Flash_bwd_params &params, cudaStream_t stream) {{
+    run_mha_bwd_hdim{HEAD_DIM}<{DTYPE}>(params, stream);
 }}
 """
 
@@ -66,9 +66,15 @@ class Kernel:
 
 
 def get_all_kernels() -> List[Kernel]:
+    # sm80 kernels: all dtypes, all directions (fwd / bwd / fwd_split)
     for dtype, head_dim, sm in itertools.product(DTYPE_MAP.keys(), HEAD_DIMENSIONS, SM):
         for direction in ["fwd", "bwd", "fwd_split"]:
             yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, direction=direction)
+    # sm75 kernels: Turing only has FP16 tensor-core MMA (SM75_16x8x8) and no cp.async,
+    # so we emit only FP16 fwd + fwd_split (inference path). bf16 and bwd stay sm80-only.
+    for head_dim in HEAD_DIMENSIONS:
+        for direction in ["fwd", "fwd_split"]:
+            yield Kernel(sm=75, dtype="fp16", head_dim=head_dim, direction=direction)
 
 
 def write_kernel(kernel: Kernel, autogen_dir: Path) -> None:

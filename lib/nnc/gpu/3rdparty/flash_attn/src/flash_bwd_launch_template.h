@@ -9,16 +9,22 @@
 #include "flash_bwd_preprocess_kernel.h"
 #include "flash_bwd_kernel.h"
 
-// Determine if the architecture supports FLASH and define a macro to handle parameter modifiers
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+// Determine if the architecture supports FLASH and define a macro to handle parameter modifiers.
+// The FlashAttention kernel_traits carry an SM75_16x8x8 FP16 (Turing Tensor Core) fallback for
+// arch < 800; bf16 MMA and cp.async remain Ampere-only (see kernel_traits.h), so sm75 backward
+// is compiled for FP16 only.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
 #define ARCH_SUPPORTS_FLASH
+#endif
+// __grid_constant__ is only valid on Ampere (sm80) and newer.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
 #define KERNEL_PARAM_MODIFIER __grid_constant__
 #else
 #define KERNEL_PARAM_MODIFIER
 #endif
 
 // Define a macro for unsupported architecture handling to centralize the error message
-#define FLASH_UNSUPPORTED_ARCH printf("FATAL: FlashAttention requires building with sm version sm80-sm90, but was built for < 8.0!");
+#define FLASH_UNSUPPORTED_ARCH printf("FATAL: FlashAttention requires building with sm version sm75+, but was built for < 7.5!");
 
 // Use a macro to clean up kernel definitions
 #define DEFINE_FLASH_BACKWARD_KERNEL(kernelName, ...) \

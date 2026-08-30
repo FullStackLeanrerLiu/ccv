@@ -385,6 +385,27 @@ cuda_library(
 	name = "nnc_cuda_compat_sm80",
 	srcs = glob([
 		"nnc/gpu/3rdparty/flash_attn/**/*.cu",
+	], exclude = [
+		"nnc/gpu/3rdparty/flash_attn/**/*_sm75.cu",
+	]),
+	hdrs = glob([
+		"nnc/gpu/3rdparty/flash_attn/**/*.h",
+		"nnc/gpu/3rdparty/flash_attn/**/*.cuh",
+	]),
+	copts = ccv_default_copts() + ["-nvcc_options", "expt-relaxed-constexpr"],
+	deps = [
+		":cutlass_headers",
+		"@local_config_ccv//config:cuda_deps"
+	]
+)
+
+# sm75 (Turing) builds compile ONLY the FP16 fwd + fwd_split kernels: bf16 MMA and
+# cp.async are Ampere-only, so the bf16 / bwd sm80 sources can't be built for sm75.
+cuda_library(
+	name = "nnc_cuda_compat_sm75",
+	srcs = glob([
+		"nnc/gpu/3rdparty/flash_attn/flash_api.cu",
+		"nnc/gpu/3rdparty/flash_attn/src/*_sm75.cu",
 	]),
 	hdrs = glob([
 		"nnc/gpu/3rdparty/flash_attn/**/*.h",
@@ -456,6 +477,9 @@ cuda_library(
 		"//config:have_cuda_sm80": [
 			"HAVE_CUDA_SM80"
 		],
+		"//config:have_cuda_sm75": [
+			"HAVE_CUDA_SM75"
+		],
 		"//conditions:default": []
 	}),
 	copts = ccv_default_copts(),
@@ -465,6 +489,9 @@ cuda_library(
 	] + select({
 		"//config:have_cuda_sm80": [
 			":nnc_cuda_compat_sm80"
+		],
+		"//config:have_cuda_sm75": [
+			":nnc_cuda_compat_sm75"
 		],
 		"//conditions:default": []
 	})
@@ -590,6 +617,11 @@ cc_library(
 	}) + select({
 		"//config:have_cuda_sm80": [
 			":nnc_cuda_compat_sm80"
+		],
+		"//conditions:default": []
+	}) + select({
+		"//config:have_cuda_sm75": [
+			":nnc_cuda_compat_sm75"
 		],
 		"//conditions:default": []
 	}) + select({

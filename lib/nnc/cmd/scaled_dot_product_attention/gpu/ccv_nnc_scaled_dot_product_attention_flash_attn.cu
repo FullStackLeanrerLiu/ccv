@@ -7,7 +7,7 @@ extern "C" {
 }
 #include <nnc/gpu/ccv_nnc_compat.h>
 
-#ifdef HAVE_CUDA_SM80
+#if defined(HAVE_CUDA_SM80) || defined(HAVE_CUDA_SM75)
 #include <nnc/gpu/3rdparty/flash_attn/flash_api.h>
 
 static int _ccv_nnc_scaled_dot_product_attention_forw(const ccv_nnc_cmd_t cmd, const ccv_nnc_hint_t hint, const int flags, ccv_nnc_tensor_t* const* const inputs, const int input_size, ccv_nnc_tensor_t* const* const outputs, const int output_size, ccv_nnc_stream_context_t* const stream_context)
@@ -171,6 +171,13 @@ static int _ccv_nnc_scaled_dot_product_attention_forw(const ccv_nnc_cmd_t cmd, c
 		(bias ? (q->info.datatype == bias->info.datatype) : 1);
 
 	assert(is_same_dtype);
+
+#ifdef HAVE_CUDA_SM75
+	// sm75 (Turing) builds ship FP16 fused kernels only (bf16 MMA is Ampere-only),
+	// so bf16 attention must fall back to the non-fused path.
+	if (q->info.datatype == CCV_16BF)
+		return CCV_NNC_EXEC_INVALID;
+#endif
 
 	Flash_fwd_params params;
 	memset(&params, 0, sizeof(params));
@@ -340,6 +347,11 @@ static int _ccv_nnc_scaled_dot_product_attention_forw(const ccv_nnc_cmd_t cmd, c
 	}
 	return CCV_NNC_EXEC_SUCCESS;
 }
+
+// Backward (gradient) attention is only built for Ampere (sm80): it uses bf16 MMA /
+// cp.async. sm75 (Turing) builds keep the forward/inference fused path only.
+#endif
+#ifdef HAVE_CUDA_SM80
 
 template<typename NUM>
 __global__ void _ccv_nnc_sum_out(const int B, const int Hk, const int r, const int D, const NUM* const a, NUM* const b)
@@ -597,7 +609,7 @@ static int _ccv_nnc_scaled_dot_product_attention_back(const ccv_nnc_cmd_t cmd, c
 
 REGISTER_COMMAND_BACKEND(CCV_NNC_SCALED_DOT_PRODUCT_ATTENTION_FORWARD, CCV_NNC_BACKEND_GPU_REF)(ccv_nnc_cmd_backend_registry_t* const registry)
 {
-#ifdef HAVE_CUDA_SM80
+#if defined(HAVE_CUDA_SM80) || defined(HAVE_CUDA_SM75)
 	registry->tensor_formats = CCV_TENSOR_FORMAT_NCHW | CCV_TENSOR_FORMAT_NHWC;
 	registry->tensor_datatypes = CCV_32F | CCV_16F | CCV_QX | CCV_16BF | CCV_32S;
 	registry->tensor_memory = CCV_TENSOR_GPU_MEMORY;

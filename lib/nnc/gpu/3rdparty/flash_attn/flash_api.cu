@@ -9,6 +9,17 @@
 #include "src/static_switch.h"
 
 void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split_kernel=false) {
+#ifdef HAVE_CUDA_SM75
+    // sm75 (Turing) builds have FP16 fwd + fwd_split kernels only: bf16 MMA is
+    // Ampere-only, so we instantiate the half_t path directly without FP16_SWITCH.
+    HEADDIM_SWITCH(params.d, [&] {
+        if (params.num_splits <= 1 && !force_split_kernel) {  // If we don't set it num_splits == 0
+            run_mha_fwd_<cutlass::half_t, kHeadDim>(params, stream);
+        } else {
+            run_mha_fwd_splitkv_dispatch<cutlass::half_t, kHeadDim>(params, stream);
+        }
+    });
+#else
     FP16_SWITCH(!params.is_bf16, [&] {
         HEADDIM_SWITCH(params.d, [&] {
             if (params.num_splits <= 1 && !force_split_kernel) {  // If we don't set it num_splits == 0
@@ -18,6 +29,7 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split
             }
         });
     });
+#endif
 }
 
 // Find the number of splits that maximizes the occupancy. For example, if we have
@@ -62,6 +74,7 @@ int num_splits_heuristic(int batch_nheads_mblocks, int num_SMs, int num_n_blocks
     return 1;
 }
 
+#ifdef HAVE_CUDA_SM80
 void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     FP16_SWITCH(!params.is_bf16, [&] {
         HEADDIM_SWITCH(params.d, [&] {
@@ -69,3 +82,4 @@ void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         });
     });
 }
+#endif

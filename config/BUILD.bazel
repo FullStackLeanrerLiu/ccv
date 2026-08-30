@@ -13,6 +13,13 @@ config_setting(
 )
 
 config_setting(
+	name = "have_cuda_sm75",
+	values = {
+		"define": "enable_sm75=true"
+	}
+)
+
+config_setting(
 	name = "have_mps",
 	values = {
 		"define": "enable_mps=true"

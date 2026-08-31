@@ -78,4 +78,36 @@ struct MMA_Traits<SM75_8x8x16_S32S8S8S32_TN>
 
 ///////////////////////////////////////////////////////////////////////////////
 
+// MMA m8n8k32 TN: Turing native INT4 tensor-core MMA
+// (mma.sync.aligned.m8n8k32.row.col.s32.s4.s4.s32).
+//
+// The 4-bit atom shares the C/D fragment structure of the 8-bit m8n8k16 atom
+// (two int32 C registers), but each uint32 A/B register now packs *8* signed
+// 4-bit elements (K = 32) instead of 4 int8 (K = 16), so the A/B fragment
+// carries 8 int4b per thread.  The thread / value layout below therefore
+// mirrors the INT8 m8n8k16 atom but with the value mode scaled to _8 (cosize
+// 256 instead of 128) and the K stride halved (_4 vs _8) so the 8 values a
+// thread owns are bit-contiguous 4-bit nibbles along K.  CLayout is unchanged.
+///////////////////////////////////////////////////////////////////////////////
+
+template <>
+struct MMA_Traits<SM75_8x8x32_S32S4S4S32_TN>
+{
+  using ValTypeD = int32_t;
+  using ValTypeA = int4b_t;
+  using ValTypeB = int4b_t;
+  using ValTypeC = int32_t;
+
+  using Shape_MNK = Shape<_8,_8,_32>;
+  using ThrID   = Layout<_32>;
+  using ALayout = Layout<Shape <Shape < _4,_8>,_8>,
+                         Stride<Stride<_32,_1>,_4>>;
+  using BLayout = Layout<Shape <Shape < _4,_8>,_8>,
+                         Stride<Stride<_32,_1>,_4>>;
+  using CLayout = Layout<Shape <Shape < _4,_8>,_2>,
+                         Stride<Stride<_16,_1>,_8>>;
+};
+
+///////////////////////////////////////////////////////////////////////////////
+
 } // namespace cute

@@ -113,6 +113,7 @@ enum {
 	CCV_NNC_GEMM_32TF = 0x2, /**< For GEMM (or similar op), whether prefer to use TF32 for accumulator. */
 	CCV_NNC_GEMM_16F = 0x4, /**< For GEMM (or similar op), whether prefer to use FP16 for accumulator. */
 	CCV_NNC_GEMM_8I = 0x8, /**< For GEMM (or similar op), whether prefer to use INT8 inputs / accumulators when supported. */
+	CCV_NNC_GEMM_4I = 0x10, /**< For GEMM (or similar op), whether prefer to use INT4 inputs / accumulators when supported. */
 };
 
 enum {

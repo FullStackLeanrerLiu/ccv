@@ -36,8 +36,16 @@ INT8_KERNEL_IMPL_TEMPLATE_FWD = """#include "flash_fwd_int8_launch_template.h"
 template void run_mha_fwd_int8_<{DTYPE}, {HEAD_DIM}>(Flash_fwd_params &params, cudaStream_t stream);
 """
 
-# Head dimensions for which the int8-QK path is available (sm75 / Turing).
+# SageAttention-style INT4-QK forward kernel (Turing sm75).  Only the fwd
+# direction is produced; there is no int4 split-kv / backward kernel.
+INT4_KERNEL_IMPL_TEMPLATE_FWD = """#include "flash_fwd_int4_launch_template.h"
+
+template void run_mha_fwd_int4_<{DTYPE}, {HEAD_DIM}>(Flash_fwd_params &params, cudaStream_t stream);
+"""
+
+# Head dimensions for which the int8-QK / int4-QK paths are available (sm75 / Turing).
 INT8_HEAD_DIMENSIONS = [64, 128, 256]
+INT4_HEAD_DIMENSIONS = [64, 128, 256]
 
 KERNEL_IMPL_TEMPLATE_BWD = """#include "flash_bwd_launch_template.h"
 
@@ -55,9 +63,14 @@ class Kernel:
     head_dim: int
     direction: str
     is_int8: bool = False
+    is_int4: bool = False
 
     @property
     def template(self) -> str:
+        if self.is_int4:
+            return INT4_KERNEL_IMPL_TEMPLATE_FWD.format(
+                DTYPE=DTYPE_MAP[self.dtype], HEAD_DIM=self.head_dim
+            )
         if self.is_int8:
             return INT8_KERNEL_IMPL_TEMPLATE_FWD.format(
                 DTYPE=DTYPE_MAP[self.dtype], HEAD_DIM=self.head_dim
@@ -79,6 +92,8 @@ class Kernel:
     def filename(self) -> str:
         if self.is_int8:
             return f"flash_fwd_int8_hdim{self.head_dim}_sm{self.sm}.cu"
+        if self.is_int4:
+            return f"flash_fwd_int4_hdim{self.head_dim}_sm{self.sm}.cu"
         return f"flash_{self.direction}_hdim{self.head_dim}_{self.dtype}_sm{self.sm}.cu"
 
 
@@ -95,6 +110,10 @@ def get_all_kernels() -> List[Kernel]:
     # sm75 INT8-QK forward kernels (SageAttention-style w8a8), fp16 inputs only.
     for head_dim in INT8_HEAD_DIMENSIONS:
         yield Kernel(sm=75, dtype="fp16", head_dim=head_dim, direction="fwd", is_int8=True)
+    # sm75 INT4-QK forward kernels (SageAttention-style, native INT4 tensor core),
+    # fp16 inputs only.
+    for head_dim in INT4_HEAD_DIMENSIONS:
+        yield Kernel(sm=75, dtype="fp16", head_dim=head_dim, direction="fwd", is_int4=True)
 
 
 def write_kernel(kernel: Kernel, autogen_dir: Path) -> None:

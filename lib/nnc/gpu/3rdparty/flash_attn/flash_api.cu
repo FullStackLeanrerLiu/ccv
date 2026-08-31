@@ -12,16 +12,22 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split
 #ifdef HAVE_CUDA_SM75
     // sm75 (Turing) builds have FP16 fwd + fwd_split kernels only: bf16 MMA is
     // Ampere-only, so we instantiate the half_t path directly without FP16_SWITCH.
-    // When is_int8qk is requested we dispatch to the INT8-QK kernel for the
-    // supported head dims {64,128,256} (fp16 inputs, non-split only); any other
-    // dim / split falls back to the standard FP16 path untouched.
-    if (params.is_int8qk && !force_split_kernel && params.num_splits <= 1) {
+    // When a quantized-QK path is requested we dispatch to the INT4-QK (native
+    // INT4 tensor core) or INT8-QK kernel for the supported head dims {64,128,256}
+    // (fp16 inputs, non-split only); any other dim / split falls back to the
+    // standard FP16 path untouched. INT4-QK is preferred over INT8-QK.
+    if (!force_split_kernel && params.num_splits <= 1 &&
+        (params.is_int4qk || params.is_int8qk)) {
+        const bool use_int4 = params.is_int4qk;
         if (params.d <= 64) {
-            run_mha_fwd_int8_<cutlass::half_t, 64>(params, stream);
+            if (use_int4) { run_mha_fwd_int4_<cutlass::half_t, 64>(params, stream); }
+            else          { run_mha_fwd_int8_<cutlass::half_t, 64>(params, stream); }
         } else if (params.d <= 128) {
-            run_mha_fwd_int8_<cutlass::half_t, 128>(params, stream);
+            if (use_int4) { run_mha_fwd_int4_<cutlass::half_t, 128>(params, stream); }
+            else          { run_mha_fwd_int8_<cutlass::half_t, 128>(params, stream); }
         } else if (params.d <= 256) {
-            run_mha_fwd_int8_<cutlass::half_t, 256>(params, stream);
+            if (use_int4) { run_mha_fwd_int4_<cutlass::half_t, 256>(params, stream); }
+            else          { run_mha_fwd_int8_<cutlass::half_t, 256>(params, stream); }
         } else {
             HEADDIM_SWITCH(params.d, [&] {
                 run_mha_fwd_<cutlass::half_t, kHeadDim>(params, stream);

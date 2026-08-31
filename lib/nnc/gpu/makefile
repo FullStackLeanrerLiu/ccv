@@ -8,9 +8,10 @@ FLASH_ATTN_SRCS += 3rdparty/flash_attn/layer_norm/ln_api.cu 3rdparty/flash_attn/
 
 # sm75 (Turing) builds compile ONLY the FP16 fwd + fwd_split kernels: bf16 MMA and
 # cp.async are Ampere-only, so the bf16 / bwd sm80 sources can't be built for sm75.
-# The SageAttention-style INT8-QK forward kernels are additionally emitted for
-# head dims {64,128,256} (flash_fwd_int8_hdim*_sm75.cu).
-FLASH_ATTN_SM75_SRCS := 3rdparty/flash_attn/flash_api.cu $(wildcard 3rdparty/flash_attn/src/flash_fwd_hdim*_fp16_sm75.cu 3rdparty/flash_attn/src/flash_fwd_split_hdim*_fp16_sm75.cu 3rdparty/flash_attn/src/flash_fwd_int8_hdim*_sm75.cu)
+# The SageAttention-style INT8-QK and INT4-QK forward kernels are additionally
+# emitted for head dims {64,128,256} (flash_fwd_int8_hdim*_sm75.cu /
+# flash_fwd_int4_hdim*_sm75.cu).
+FLASH_ATTN_SM75_SRCS := 3rdparty/flash_attn/flash_api.cu $(wildcard 3rdparty/flash_attn/src/flash_fwd_hdim*_fp16_sm75.cu 3rdparty/flash_attn/src/flash_fwd_split_hdim*_fp16_sm75.cu 3rdparty/flash_attn/src/flash_fwd_int8_hdim*_sm75.cu 3rdparty/flash_attn/src/flash_fwd_int4_hdim*_sm75.cu)
 
 SRCS := ccv_nnc_compat.cu ccv_nnc_palettize.cu
 

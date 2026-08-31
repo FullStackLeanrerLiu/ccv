@@ -117,4 +117,50 @@ struct SM75_8x8x16_S32S8S8S32_TN
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+//
+// SM75 MMA 8832 S4S4S32
+//
+// Turing's native 4-bit (INT4) tensor-core MMA:
+//   mma.sync.aligned.m8n8k32.row.col.s32.s4.s4.s32
+//
+// A/B fragments each hold one uint32 which packs 8 signed 4-bit (int4b_t)
+// values along K=32; C/D are two uint32 (int32 accumulators), exactly like
+// the sibling M8N8K16 INT8 atom but with K reaching 32 because 4-bit operands
+// are twice as dense per register.  This wraps the same PTX instruction that
+// cutlass's SM80_8x8x32_S32S4S4S32_TN uses; on sm75 the instruction is natively
+// supported under CUTE_ARCH_MMA_SM75_ENABLED.
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+struct SM75_8x8x32_S32S4S4S32_TN
+{
+  using DRegisters = uint32_t[2];
+  using ARegisters = uint32_t[1];
+  using BRegisters = uint32_t[1];
+  using CRegisters = uint32_t[2];
+
+  // Register asm fma
+  CUTE_HOST_DEVICE static void
+  fma(uint32_t      & d0, uint32_t      & d1,
+      uint32_t const& a0,
+      uint32_t const& b0,
+      uint32_t const& c0, uint32_t const& c1)
+  {
+#if defined(CUTE_ARCH_MMA_SM75_ENABLED)
+    asm volatile("mma.sync.aligned.m8n8k32.row.col.s32.s4.s4.s32"
+                 "{%0, %1},"
+                 "{%2},"
+                 "{%3},"
+                 "{%4, %5};\n"
+        : "=r"(d0), "=r"(d1)
+        :  "r"(a0),
+           "r"(b0),
+           "r"(c0),  "r"(c1));
+#else
+    CUTE_RUNTIME_ASSERT("Attempting to use SM75_8x8x32_S32S4S4S32_TN without CUTE_ARCH_MMA_SM75_ENABLED");
+#endif
+  }
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 } // end namespace cute

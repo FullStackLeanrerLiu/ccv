@@ -346,6 +346,28 @@ void cuunregister(void* ptr)
 
 void cufileread(const int fd, const off_t file_offset, void* const buf, const size_t size)
 {
+	// GPUDirect Storage (GDS) is only usable when the nvidia-fs kernel module and
+	// cuFile driver are available. On machines without them (no /dev/gds*, no
+	// nvidia-fs module), cuFileHandleRegister always fails with an internal error.
+	// Detect this once and fall back to mmap+memcpy cleanly instead of logging a
+	// spurious error on every checkpoint load.
+	static int gds_usable = -1; // -1 = probe, 0 = unavailable, 1 = usable
+	if (gds_usable == -1)
+	{
+		CUfileError_t init = cuFileDriverOpen();
+		gds_usable = (init.err == CU_FILE_SUCCESS) ? 1 : 0;
+	}
+	if (gds_usable != 1)
+	{
+		void* bufptr = mmap(0, size, PROT_READ, MAP_PRIVATE, fd, file_offset);
+		if (bufptr != MAP_FAILED)
+		{
+			madvise(bufptr, size, MADV_SEQUENTIAL | MADV_WILLNEED);
+			cumemcpy(buf, CCV_TENSOR_GPU_MEMORY, bufptr, CCV_TENSOR_CPU_MEMORY, size);
+			munmap(bufptr, size);
+		}
+		return;
+	}
 	CUfileDescr_t file_descr = {
 		.type = CU_FILE_HANDLE_TYPE_OPAQUE_FD,
 		.handle = {

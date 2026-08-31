@@ -172,6 +172,19 @@ static int _ccv_nnc_scaled_dot_product_attention_forw(const ccv_nnc_cmd_t cmd, c
 
 	assert(is_same_dtype);
 
+	// --- DIAG(1): one-time print whenever the fused SDPA forward is even reached ---
+	{
+		static bool s_diag = false;
+		if (!s_diag) {
+			s_diag = true;
+			const ccv_nnc_cuda_device_prop_t dp = ccv_nnc_gpu_device_props();
+			fprintf(stderr, "[SDPA-DIAG] fused forward reached: datatype=%d bf16=%d D=%d R=%d C=%d Hq=%d varlen=%d cc=%d.%d flags=%#x\n",
+				q->info.datatype, (q->info.datatype == CCV_16BF), D, R, C, Hq, is_varlen, dp.major, dp.minor,
+				cmd.info.scaled_dot_product_attention.flags);
+		}
+	}
+	// --- END DIAG(1) ---
+
 #ifdef HAVE_CUDA_SM75
 	// sm75 (Turing) builds ship FP16 fused kernels only (bf16 MMA is Ampere-only),
 	// so bf16 attention must fall back to the non-fused path.
@@ -270,6 +283,16 @@ static int _ccv_nnc_scaled_dot_product_attention_forw(const ccv_nnc_cmd_t cmd, c
 		params.softmax_lse_ptr = workspace;
 	}
 	cudaStream_t stream = ccv_nnc_stream_context_get_stream(stream_context);
+	// --- DIAG(2): one-time print of the chosen fused kernel path ---
+	{
+		static bool s_diag2 = false;
+		if (!s_diag2) {
+			s_diag2 = true;
+			fprintf(stderr, "[SDPA-DIAG] dispatch: int8=%d int4=%d splits=%d D=%d bf16=%d\n",
+				(int)params.is_int8qk, (int)params.is_int4qk, params.num_splits, D, (int)params.is_bf16);
+		}
+	}
+	// --- END DIAG(2) ---
 	run_mha_fwd(params, stream, false);
 	CUDA_ENFORCE(cudaGetLastError());
 	if (weights)

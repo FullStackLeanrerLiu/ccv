@@ -411,6 +411,7 @@ cuda_library(
 		"nnc/gpu/3rdparty/flash_attn/**/*.h",
 		"nnc/gpu/3rdparty/flash_attn/**/*.cuh",
 	]),
+	defines = ["HAVE_CUDA_SM75"],
 	copts = ccv_default_copts() + ["-nvcc_options", "expt-relaxed-constexpr"],
 	deps = [
 		":cutlass_headers",

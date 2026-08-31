@@ -232,22 +232,22 @@ static int _ccv_nnc_scaled_dot_product_attention_forw(const ccv_nnc_cmd_t cmd, c
 	params.num_splits = (!is_varlen && R == 1) ? num_splits_heuristic(batch_size * Hq * num_m_blocks, props.multi_processor_count * 2, num_n_blocks, 128) : 1;
 #ifdef HAVE_CUDA_SM75
 	// SageAttention-style quantized-QK fusion for Turing (sm75 / RTX 2080 Ti):
-	// enabled only for fp16 inputs, head dim in {64,128,256}, non-varlen, and
-	// when the caller asked for INT4 (CCV_NNC_GEMM_4I) or INT8 (CCV_NNC_GEMM_8I)
-	// precision.  The quantized-QK path is non-split only, so the split-kv
-	// heuristic is overridden to 1.  INT4 is preferred when both flags are set.
-	// Otherwise this code is inert and the standard FP16 kernel runs exactly as
-	// before.
-	if (q->info.datatype == CCV_16F && (D == 64 || D == 128 || D == 256) &&
-	    (cmd.info.scaled_dot_product_attention.flags & CCV_NNC_GEMM_4I) &&
-	    props.major == 7 && props.minor == 5 && !is_varlen) {
-		params.is_int4qk = true;
-		params.num_splits = 1;
-	} else if (q->info.datatype == CCV_16F && (D == 64 || D == 128 || D == 256) &&
-	    (cmd.info.scaled_dot_product_attention.flags & CCV_NNC_GEMM_8I) &&
-	    props.major == 7 && props.minor == 5 && !is_varlen) {
-		params.is_int8qk = true;
-		params.num_splits = 1;
+	// fp16 inputs, head dim in {64,128,256}, non-varlen, compute 7.5.  The
+	// quantized-QK path is non-split only, so the split-kv heuristic is overridden
+	// to 1.  Explicit INT4/INT8 flags from the caller win; otherwise (drawthings
+	// never sets them) we default to INT8-QK on the fp16 fused path for speed.
+	const bool sm75_qk_eligible =
+		q->info.datatype == CCV_16F && (D == 64 || D == 128 || D == 256) &&
+		props.major == 7 && props.minor == 5 && !is_varlen;
+	if (sm75_qk_eligible) {
+		// INT4 wins when explicitly requested; otherwise INT8-QK (explicit
+		// GEMM_8I or the default when no quantization flag is set).
+		const bool want_int4 = (cmd.info.scaled_dot_product_attention.flags & CCV_NNC_GEMM_4I) != 0;
+		params.num_splits = 1;  // quantized-QK fused kernel is non-split only
+		if (want_int4)
+			params.is_int4qk = true;
+		else
+			params.is_int8qk = true;
 	}
 #endif
 	if (saved_softmax_lse)

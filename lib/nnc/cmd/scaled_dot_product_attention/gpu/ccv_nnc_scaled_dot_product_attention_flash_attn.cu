@@ -230,6 +230,19 @@ static int _ccv_nnc_scaled_dot_product_attention_forw(const ccv_nnc_cmd_t cmd, c
 	const ccv_nnc_cuda_device_prop_t props = ccv_nnc_gpu_device_props();
 	// Only enable splitkv if R is 1.
 	params.num_splits = (!is_varlen && R == 1) ? num_splits_heuristic(batch_size * Hq * num_m_blocks, props.multi_processor_count * 2, num_n_blocks, 128) : 1;
+#ifdef HAVE_CUDA_SM75
+	// SageAttention-style INT8-QK fusion for Turing (sm75 / RTX 2080 Ti): enable
+	// only for fp16 inputs, head dim in {64,128,256}, and when the caller asked
+	// for INT8 precision (CCV_NNC_GEMM_8I). The int8-QK path is non-split only, so
+	// the split-kv heuristic is overridden to 1. Otherwise this code is inert and
+	// the standard FP16 kernel runs exactly as before.
+	if (q->info.datatype == CCV_16F && (D == 64 || D == 128 || D == 256) &&
+	    (cmd.info.scaled_dot_product_attention.flags & CCV_NNC_GEMM_8I) &&
+	    props.major == 7 && props.minor == 5 && !is_varlen) {
+		params.is_int8qk = true;
+		params.num_splits = 1;
+	}
+#endif
 	if (saved_softmax_lse)
 		params.softmax_lse_ptr = saved_softmax_lse->data.u8;
 	if (params.num_splits > 1)

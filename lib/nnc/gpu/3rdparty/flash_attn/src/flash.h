@@ -211,6 +211,12 @@ struct Flash_fwd_params : public Qkv_params {
     bool is_bf16;
     bool is_causal;
 
+    // When set, the sm75 (Turing) forward path runs the SageAttention-style
+    // INT8-QK kernel (Q/K dynamically quantized to int8, int8 mma, fp32
+    // dequantized softmax, FP16 PV).  Only valid for fp16 inputs and for head
+    // dims in {64, 128, 256}; otherwise the standard FP16 kernel is used.
+    bool is_int8qk;
+
     // If is_seqlens_k_cumulative, then seqlen_k is cu_seqlens_k[bidb + 1] - cu_seqlens_k[bidb].
     // Otherwise it's cu_seqlens_k[bidb], i.e., we use cu_seqlens_k to store the sequence lengths of K.
     bool is_seqlens_k_cumulative;
@@ -269,5 +275,6 @@ struct Flash_bwd_params : public Flash_fwd_params {
 
 template<typename T, int Headdim> void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream);
 template<typename T, int Headdim> void run_mha_fwd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t stream);
+template<typename T, int Headdim> void run_mha_fwd_int8_(Flash_fwd_params &params, cudaStream_t stream);
 
 template<typename T, int Headdim> void run_mha_bwd_(Flash_bwd_params &params, cudaStream_t stream);

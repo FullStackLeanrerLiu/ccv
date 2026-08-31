@@ -130,6 +130,49 @@ static __device__ __forceinline__ T run(T x, Operator &op) {
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+// SageAttention-style INT8-QK helpers (Turing sm75).
+// Dynamic per-warp quantization of Q/K: an fp32 scale is derived from the per-warp abs-max of
+// the (fp16) fragment, then every element is rounded to int8. The INT8 mma accumulates in int32;
+// dequantizing the int32 score by scale_q * scale_k recovers Q*K (see flash_int8_fwd_kernel.h).
+
+// Warp-wide all-reduce maximum of a single fp32 value (butterfly shuffles).
+__device__ __forceinline__ float warp_allreduce_max(float v) {
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        v = fmaxf(v, __shfl_xor_sync(uint32_t(-1), v, off));
+    }
+    return v;
+}
+
+// Per-fragment abs-max over all elements a thread holds.
+template<typename Engine, typename Layout>
+__device__ __forceinline__ float frag_amax(Tensor<Engine, Layout> const &t) {
+    constexpr int numel = decltype(size(t))::value;
+    float m = 0.f;
+    #pragma unroll
+    for (int i = 0; i < numel; ++i) {
+        float x = static_cast<float>(t(i));
+        m = fmaxf(m, x < 0.f ? -x : x);
+    }
+    return m;
+}
+
+// Convert an fp16 (or fp32) register fragment to int8 in-place, using inv_scale = 127 / amax.
+// Values are round-to-nearest and clipped to [-127, 127] (scale stays symmetric in [-1,1]).
+template<typename QEngine, typename Engine, typename Layout>
+__device__ __forceinline__ void quantize_fragment(Tensor<QEngine, Layout> const &dst,
+                                                  Tensor<Engine, Layout> const &src, float inv_scale) {
+    constexpr int numel = decltype(size(dst))::value;
+    static_assert(decltype(size(src))::value == numel);
+    #pragma unroll
+    for (int i = 0; i < numel; ++i) {
+        int q = __float2int_rn(static_cast<float>(src(i)) * inv_scale);
+        q = q > 127 ? 127 : (q < -127 ? -127 : q);
+        dst(i) = static_cast<int8_t>(q);
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template<bool A_in_regs=false, bool B_in_regs=false, typename Tensor0, typename Tensor1,
          typename Tensor2, typename Tensor3, typename Tensor4,

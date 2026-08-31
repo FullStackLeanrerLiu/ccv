@@ -29,6 +29,16 @@ KERNEL_IMPL_TEMPLATE_FWD_SPLIT = """#include "flash_fwd_launch_template.h"
 template void run_mha_fwd_splitkv_dispatch<{DTYPE}, {HEAD_DIM}>(Flash_fwd_params &params, cudaStream_t stream);
 """
 
+# SageAttention-style INT8-QK forward kernel (Turing sm75).  Only the fwd
+# direction is produced; there is no int8 split-kv / backward kernel.
+INT8_KERNEL_IMPL_TEMPLATE_FWD = """#include "flash_fwd_int8_launch_template.h"
+
+template void run_mha_fwd_int8_<{DTYPE}, {HEAD_DIM}>(Flash_fwd_params &params, cudaStream_t stream);
+"""
+
+# Head dimensions for which the int8-QK path is available (sm75 / Turing).
+INT8_HEAD_DIMENSIONS = [64, 128, 256]
+
 KERNEL_IMPL_TEMPLATE_BWD = """#include "flash_bwd_launch_template.h"
 
 template<>
@@ -44,9 +54,14 @@ class Kernel:
     dtype: str
     head_dim: int
     direction: str
+    is_int8: bool = False
 
     @property
     def template(self) -> str:
+        if self.is_int8:
+            return INT8_KERNEL_IMPL_TEMPLATE_FWD.format(
+                DTYPE=DTYPE_MAP[self.dtype], HEAD_DIM=self.head_dim
+            )
         if self.direction == "fwd":
             return KERNEL_IMPL_TEMPLATE_FWD.format(
                 DTYPE=DTYPE_MAP[self.dtype], HEAD_DIM=self.head_dim
@@ -62,6 +77,8 @@ class Kernel:
 
     @property
     def filename(self) -> str:
+        if self.is_int8:
+            return f"flash_fwd_int8_hdim{self.head_dim}_sm{self.sm}.cu"
         return f"flash_{self.direction}_hdim{self.head_dim}_{self.dtype}_sm{self.sm}.cu"
 
 
@@ -75,6 +92,9 @@ def get_all_kernels() -> List[Kernel]:
     for head_dim in HEAD_DIMENSIONS:
         for direction in ["fwd", "fwd_split"]:
             yield Kernel(sm=75, dtype="fp16", head_dim=head_dim, direction=direction)
+    # sm75 INT8-QK forward kernels (SageAttention-style w8a8), fp16 inputs only.
+    for head_dim in INT8_HEAD_DIMENSIONS:
+        yield Kernel(sm=75, dtype="fp16", head_dim=head_dim, direction="fwd", is_int8=True)
 
 
 def write_kernel(kernel: Kernel, autogen_dir: Path) -> None:

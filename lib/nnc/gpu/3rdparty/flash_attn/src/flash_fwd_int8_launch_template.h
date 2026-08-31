@@ -72,8 +72,13 @@ void run_mha_fwd_int8_hdim128(Flash_fwd_params &params, cudaStream_t stream) {
 template<typename T>
 void run_mha_fwd_int8_hdim256(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 256;
-    constexpr static int kBlockM = 32;
-    constexpr static int kBlockN = 16;
+    // Turing shared memory is capped at 64KB/block (no opt-in >64KB like Ampere).
+    // With the FP16 Q/K/V tiles plus the INT8-QK buffers + fp32 score spill, the
+    // largest tile that fits is 16x32 (55488B). 16x32 keeps block-N even so the
+    // dropout bit-pairing (f16x2) requirement holds, and gives finer M-granularity
+    // parallelism which suits long video sequences on a Turing card.
+    constexpr static int kBlockM = 16;
+    constexpr static int kBlockN = 32;
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
         BOOL_SWITCH(params.is_causal, Is_causal, [&] {
             run_flash_fwd_int8<Flash_int8_kernel_traits<Headdim, kBlockM, kBlockN, 4>, Is_dropout, Is_causal>(params, stream);

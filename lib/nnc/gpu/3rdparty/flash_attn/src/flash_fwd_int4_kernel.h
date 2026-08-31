@@ -330,10 +330,14 @@ inline __device__ void compute_attn_int4_1rowblock(const Params &params, const i
 
         Tensor acc_s8 = partition_fragment_C(tiled_mma_qk, Shape<Int<kBlockM>, Int<kBlockN>>{});
         clear(acc_s8);
-        #pragma unroll
-        for (int i = 0; i < size<2>(tSrQ4); ++i) {
-            cute::gemm(tiled_mma_qk, tSrQ4(_, _, i), tSrK4(_, _, i), acc_s8);
-        }
+        // Thread-local register GEMM.  Must pass the INT4 MMA_Atom (TiledMMA's
+        // base, Kernel_traits::TiledMmaQk::Atom) rather than the TiledMMA itself:
+        // cute::gemm's register-geMM overloads only accept an MMA_Atom and do not
+        // deduce through the TiledMMA -> MMA_Atom base class.  Pass the *full*
+        // rank-3 A/B fragments; layout[5] walks the K-mode internally, mirroring
+        // the INT8 kernel's gemm loop.  acc_s8 is used both as the accumulated C
+        // and the output D (D = A*B + C).
+        cute::gemm(typename Kernel_traits::TiledMmaQk::Atom{}, acc_s8, tSrQ4, tSrK4, acc_s8);
 
         // Dequantize acc_s8 (int32) -> sR (row-major fp32) using per-row scales.
         Tensor cS = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
@@ -413,10 +417,7 @@ inline __device__ void compute_attn_int4_1rowblock(const Params &params, const i
 
         Tensor acc_s8 = partition_fragment_C(tiled_mma_qk, Shape<Int<kBlockM>, Int<kBlockN>>{});
         clear(acc_s8);
-        #pragma unroll
-        for (int i = 0; i < size<2>(tSrQ4); ++i) {
-            cute::gemm(tiled_mma_qk, tSrQ4(_, _, i), tSrK4(_, _, i), acc_s8);
-        }
+        cute::gemm(typename Kernel_traits::TiledMmaQk::Atom{}, acc_s8, tSrQ4, tSrK4, acc_s8);
 
         Tensor cS = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
         Tensor tScS = thr_mma_qk.partition_C(cS);

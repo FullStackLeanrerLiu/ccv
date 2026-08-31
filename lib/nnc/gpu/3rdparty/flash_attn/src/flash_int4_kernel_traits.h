@@ -7,13 +7,14 @@
  * Rationale
  * ---------
  * Identical scaffolding to flash_int8_kernel_traits.h: the original FP16 PV
- * mma and C-fragment layout are inherited from the same FP16 Base, and a
- * *separate* INT4 TiledMma ("TiledMmaQk") computes S = Q4 @ K4^T on Turing's
- * native 4-bit tensor core (mma.sync.aligned.m8n8k32.row.col.s32.s4.s4.s32,
- * SM75_8x8x32_S32S4S4S32_TN, M8 N8 K32) into an int32 accumulator.  The
- * dequantized fp32 scores are spilled through a small row-major shared tile
- * (sR) and re-read into the FP16 C-fragment so the unchanged FP16 softmax and
- * FP16 PV stage are reused verbatim.
+ * mma and C-fragment layout are inherited from the same FP16 Base, and the QK
+ * stage computes S = Q4 @ K4^T on Turing's native 4-bit tensor core
+ * (mma.sync.aligned.m8n8k32.row.col.satfinite.s32.u4.s4.s32, M8 N8 K32)
+ * into an int32 accumulator using the canonical cutlass::arch::Mma functor —
+ * no CuTe TiledMMA / MMA_Atom layout abstraction.  The dequantized fp32 scores
+ * are spilled through a small row-major shared tile (sR) and re-read into the
+ * FP16 C-fragment so the unchanged FP16 softmax and FP16 PV stage are reused
+ * verbatim.
  *
  * Shared memory notes
  * -------------------
@@ -32,6 +33,9 @@
 
 #include <cute/algorithm/copy.hpp>
 #include <cutlass/cutlass.h>
+#include <cutlass/gemm/gemm.h>
+#include <cutlass/layout/matrix.h>
+#include <cutlass/arch/mma_sm75.h>
 
 template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, typename elem_type = cutlass::half_t,
          typename Base_ = Flash_fwd_kernel_traits<kHeadDim_, kBlockM_, kBlockN_, kNWarps_, false, false, elem_type>>
@@ -65,16 +69,6 @@ struct Flash_int4_kernel_traits : public Base_ {
     using QKElem = cutlass::int4b_t;
     using QKAcc = int32_t;
 
-    // S = Q4 @ K4^T =>  A = Q tile (M = kBlockM), B = K tile (M = kBlockN).
-    // Warps are laid out along M exactly like the FP16 path; every warp covers
-    // a disjoint (kBlockM/kNWarps) x (kBlockN) slab of S.
-    // Tile M = 8 (atom M) * kNWarps, Tile N = 16 (2 N8 atoms), Tile K = 32
-    // (one full m8n8k32 atom covers 32 dims of the head dimension).
-    using TiledMmaQk = TiledMMA<
-        MMA_Atom<SM75_8x8x32_S32S4S4S32_TN>,
-        Layout<Shape<Int<kNWarps>, _1, _1>>,
-        Tile<Int<8 * kNWarps>, _16, _32>>;
-
     // ---- INT4 Q/K shared memory (packed row-major bytes, 2 int4 per byte). ----
     // The second dimension is kHeadDim / 2 because every byte caches two 4-bit
     // values; stride kHeadDim/2 is the packed row length.  The intrinsic layout
@@ -91,9 +85,10 @@ struct Flash_int4_kernel_traits : public Base_ {
     static constexpr int kSmemQ4Size = kBlockM * (kHeadDim / 2);   // bytes (packed, 2int4/byte)
     static constexpr int kSmemK4Size = kBlockN * (kHeadDim / 2);   // bytes (packed, 2int4/byte)
     static constexpr int kSmemScaleSize = (kBlockM + kBlockN) * sizeof(float);  // bytes
+    static constexpr int kSmemKsumSize = kBlockN * sizeof(float);  // per-column sum of K4 (u4-bias back-subtract)
     static constexpr int kSmemScoresSize = size(ScoresSmemLayout{}) * sizeof(float); // bytes
     static constexpr int kSmemSize = Base::kSmemSize
-        + kSmemQ4Size + kSmemK4Size + kSmemScaleSize + kSmemScoresSize;
+        + kSmemQ4Size + kSmemK4Size + kSmemScaleSize + kSmemKsumSize + kSmemScoresSize;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

@@ -2,13 +2,15 @@
  * Copyright (c) 2026, ccv.
  *
  * SageAttention-style INT4-QK + FP16-PV flash-attention forward kernel
- * (Turing sm75 only).  Q/K are dynamically quantized to signed 4-bit (int4),
- * stored in shared memory PACKED two-values-per-byte, the QK score GEMM runs
- * on Turing's native INT4 tensor core (mma.s4.m8n8k32) into an int32
- * accumulator, the result is dequantized (x scale_q * scale_k) to fp32 and
- * spilled through a row-major shared-memory tile, then re-read into the
- * original FP16 C-fragment (`acc_s`) so the unchanged FP16 softmax and FP16
- * PV stage can be reused verbatim.
+ * (Turing sm75 only).  Q/K are dynamically quantized to 4-bit, stored in shared
+ * memory PACKED two-values-per-byte.  The QK score GEMM runs on Turing's native
+ * INT4 tensor core via the canonical cutlass::arch::Mma functor
+ * (mma.sync.aligned.m8n8k32.row.col.satfinite.s32.u4.s4.s32): Q as uint4
+ * (bias-shifted +8 into [0,15]), K as signed int4 [-8,7].  The int32 accumulator
+ * is dequantized back to fp32 scores (x scale_q * scale_k, minus the u4 +8 bias
+ * term 8 * columnsKsum), spilled through a row-major shared-memory tile, then
+ * re-read into the original FP16 C-fragment (`acc_s`) so the unchanged FP16
+ * softmax and FP16 PV stage are reused verbatim.
  *
  * This kernel intentionally does NOT modify flash_fwd_kernel.h: the existing
  * FP16 / FP32 (sm75 / sm80) forward kernels and the backward kernels are left
@@ -54,9 +56,9 @@ constexpr float kInt4Range = 8.f;
 // j).  `s` is the (swizzled) FP16 tile; `s4` points to the packed byte tile
 // whose row length is HeadDim / 2 bytes.
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-template<int nRows, int HeadDim, int kNThreads, typename F16Tensor>
+template<int nRows, int HeadDim, int kNThreads, bool QuantizeUnsigned, typename F16Tensor>
 __device__ __forceinline__ void int4_pack_rows(F16Tensor const& s, uint8_t* __restrict__ s4,
-                                               float* __restrict__ scales) {
+                                               float* __restrict__ scales, float* __restrict__ rowsum) {
     #pragma unroll 1
     for (int r = threadIdx.x; r < nRows; r += kNThreads) {
         float amax = 0.f;
@@ -69,6 +71,7 @@ __device__ __forceinline__ void int4_pack_rows(F16Tensor const& s, uint8_t* __re
         const float inv = amax > 1e-12f ? kInt4Range / amax : 0.f;
         scales[r] = scale;
         uint8_t* const row4 = s4 + r * (HeadDim / 2);
+        float sum = 0.f;
         #pragma unroll 1
         for (int j = 0; j < HeadDim; j += 2) {
             const float v0 = (float)s(r, j + 0) * inv;
@@ -77,35 +80,114 @@ __device__ __forceinline__ void int4_pack_rows(F16Tensor const& s, uint8_t* __re
             int q1 = (int)(v1 < 0.f ? v1 - 0.5f : v1 + 0.5f);
             q0 = q0 < -8 ? -8 : (q0 > 7 ? 7 : q0);
             q1 = q1 < -8 ? -8 : (q1 > 7 ? 7 : q1);
+            if (QuantizeUnsigned) {
+                // A-operand stored as unsigned 4-bit in [0,15]: bias by +8 so that
+                // the signed range [-8,7] maps onto [0,15] for the u4.s4 mma.
+                q0 += 8; q1 += 8;
+            } else {
+                // B-operand stays signed 4-bit [-8,7] (s4).  Track the signed row
+                // sum for the u4-bias back-subtraction in the epilogue.
+                sum += q0 + q1;
+            }
             row4[j / 2] = (uint8_t)((q0 & 0xF) | ((q1 & 0xF) << 4));
         }
+        if (!QuantizeUnsigned && rowsum != nullptr) { rowsum[r] = sum; }
     }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-// Fill a per-thread INT4 fragment (value type cute::int4b_t) by reading nibbles
-// out of the PACKED byte tile.  `tFrag` is the fragment produced by
-// `partition_fragment_A/B(...)`; `tCoord` is the matching coordinate fragment
-// from partitioning an identity M x K tensor, so element e of the (flattened)
-// fragment holds logical (row, k) coordinates.  The m8n8k32 S4 register layout
-// is determined by cute from the MMA_Traits; the fragment values are integer
-// S4 values in [-8, 7] which cute packs 2-per-byte into the uint32 A/B register
-// at MMA time.
+// Native Turing m8n8k32 INT4-QK GEMM for one block tile:
+//   S[rowquad + mbase][colquad] = sum_k  Q4[..][k] * K4[..][k]
+// A-operand = Q tile (uint4, bias-shifted [0,15]), B-operand = K tile (int4),
+// executed with the canonical cutlass::arch::Mma functor
+// ( mma.sync.aligned.m8n8k32.row.col.satfinite.s32.u4.s4.s32 ).
+//
+// Thread map (32 lanes/warp, documented m8n8k32 layout):
+//   quad = lid / 4  -> the (M or N) row index within the 8x8 output tile
+//   lane = lid % 4  -> splits the K=32 dimension: this lane owns K = kbase + [lane*8, lane*8+8)
+//   C(row, col) with row = mbase + quad, col = nbase + {2*lane, 2*lane+1}; each lane holds 2 int32.
+// Each of the 8 A-values maps to (mbase+quad, kbase+lane*8+0..7); the matching 8 B-values map to
+// (nbase+quad, kbase+lane*8+0..7).  Values are unpacked from the packed byte tile (2 int4 / byte).
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-template<int RowStrideBytes,
-         typename ValFrag, typename CoordFrag>
-__device__ __forceinline__ void fill_int4_fragment(ValFrag& tFrag, CoordFrag const& tCoord,
-                                                   uint8_t const* __restrict__ s4) {
-    auto f = flatten(tFrag);
-    auto c = flatten(tCoord);
-    #pragma unroll
-    for (int e = 0; e < size(f); ++e) {
-        const int row = get<0>(c(e));
-        const int k   = get<1>(c(e));
-        const uint8_t byte = s4[row * RowStrideBytes + (k >> 1)];
-        int nib = (k & 1) ? ((byte >> 4) & 0xF) : (byte & 0xF);
-        if (nib & 8) { nib -= 16; }  // sign extend 4-bit -> [-8, 7]
-        f(e) = cute::int4b_t(nib);
+template<typename TraitsT>
+__device__ __forceinline__ void int4_qk_native(float* __restrict__ sR, int sRStride,
+                                               uint8_t const* __restrict__ sQ4,
+                                               uint8_t const* __restrict__ sK4,
+                                               float const* __restrict__ sQsc,
+                                               float const* __restrict__ sKsc,
+                                               float const* __restrict__ sKsum) {
+    static constexpr int kBlockM = TraitsT::kBlockM;
+    static constexpr int kBlockN = TraitsT::kBlockN;
+    static constexpr int kHeadDim = TraitsT::kHeadDim;
+    static constexpr int kNWarps = TraitsT::kNWarps;
+    static constexpr int kHeadDimBytes = kHeadDim / 2;   // packed INT4 row length
+
+    const int lid = threadIdx.x & 31;
+    const int quad = lid >> 2;        // 0..7
+    const int lane = lid & 3;         // 0..3
+    const int warp = threadIdx.x >> 5;
+
+    // S is kBlockM x kBlockN.  Warps tile the M dimension; each warp computes its
+    // own 8-row slab (Kernel_Traits lays the 4 warps along M).  Native mma functor.
+    using MmaS4 = cutlass::arch::Mma<
+        cutlass::gemm::GemmShape<8, 8, 32>,
+        32,
+        cutlass::uint4b_t,   cutlass::layout::RowMajor,
+        cutlass::int4b_t,    cutlass::layout::ColumnMajor,
+        int,                 cutlass::layout::RowMajor,
+        cutlass::arch::OpMultiplyAddSaturate>;
+
+    constexpr int kMmaM = 8, kMmaN = 8, kMmaK = 32;
+    // Warps tile the M dimension in 8-row slabs.  kBlockM may not be an exact
+    // multiple of kMmaM*kNWarps (e.g. the hdim-256 launch uses kBlockM=16 with
+    // 4 warps), so over-cover with ceil-div and guard each row write below.
+    const int m_tiles = (kBlockM + (kMmaM * kNWarps) - 1) / (kMmaM * kNWarps);
+    const int n_tiles = kBlockN / kMmaN;
+    const int k_tiles = kHeadDim / kMmaK;
+
+    for (int mt = 0; mt < m_tiles; ++mt) {
+        const int mbase = mt * kMmaM * kNWarps + warp * kMmaM;   // this warp's 8 rows
+        for (int nt = 0; nt < n_tiles; ++nt) {
+            const int nbase = nt * kMmaN;
+            MmaS4::FragmentC c; c.clear();
+            #pragma unroll
+            for (int kt = 0; kt < k_tiles; ++kt) {
+                const int kbase = kt * kMmaK;
+                MmaS4::FragmentA a; MmaS4::FragmentB b;
+                // lane owns K = kbase + [lane*8, lane*8+8)
+                const int k0 = kbase + lane * 8;
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const int kk = k0 + i;
+                    const int byte = kk >> 1;
+                    const int hi = kk & 1;
+                    // A: Q4 row = mbase + quad
+                    const uint8_t qb = sQ4[(mbase + quad) * kHeadDimBytes + byte];
+                    a[i] = cutlass::uint4b_t((qb >> (hi * 4)) & 0xF);
+                    // B: K4 row = nbase + quad
+                    const uint8_t kb = sK4[(nbase + quad) * kHeadDimBytes + byte];
+                    b[i] = cutlass::int4b_t(kb >> (hi * 4));   // int4b_t masks the low 4 bits
+                }
+                MmaS4 mma;
+                MmaS4::FragmentC d;
+                mma(d, a, b, c);
+                c = d;
+            }
+
+            // Dequantize to fp32 score.  u4×s4: the u4 operand carries a +8 bias, so a score
+            // element S = (sum_k (u4-8)*s4) = raw_acc_value - 8 * (column key sum).
+            // c[0] -> (row, col0), c[1] -> (row, col1).
+            const int col0 = nbase + 2 * lane;
+            const int col1 = col0 + 1;
+            const int row = mbase + quad;
+            if (row < kBlockM) {
+                const float qscale = sQsc[row];
+                sR[row * sRStride + col0] = (float)c[0] * qscale * sKsc[col0]
+                                             - 8.f * sKsum[col0] * qscale * sKsc[col0];
+                sR[row * sRStride + col1] = (float)c[1] * qscale * sKsc[col1]
+                                             - 8.f * sKsum[col1] * qscale * sKsc[col1];
+            }
+        }
     }
 }
 
@@ -129,7 +211,6 @@ inline __device__ void compute_attn_int4_1rowblock(const Params &params, const i
     constexpr int kHeadDim = Kernel_traits::kHeadDim;
     constexpr int kNWarps = Kernel_traits::kNWarps;
     constexpr int kNThreads = Kernel_traits::kNThreads;
-    constexpr int kHeadDimBytes = kHeadDim / 2;   // packed INT4 row length
 
     auto seed_offset = philox::unpack(params.philox_args);
     flash::Dropout dropout(std::get<0>(seed_offset), std::get<1>(seed_offset), params.p_dropout_in_uint8_t,
@@ -218,14 +299,12 @@ inline __device__ void compute_attn_int4_1rowblock(const Params &params, const i
     Tensor sVtNoSwizzle = make_tensor(sV.data(), typename Kernel_traits::SmemLayoutVtransposedNoSwizzle{});
 
     // ---- INT4 buffers, allocated right after the FP16 Q/K/V smem region. ----
-    typename Kernel_traits::TiledMmaQk tiled_mma_qk;
-    auto thr_mma_qk = tiled_mma_qk.get_thread_slice(tidx);
-
     uint8_t* const sQ4ptr = reinterpret_cast<uint8_t*>(smem_) + Kernel_traits::Base::kSmemSize;
     uint8_t* const sK4ptr = sQ4ptr + Kernel_traits::kSmemQ4Size;
     float*  const sQsc  = reinterpret_cast<float*>(sK4ptr + Kernel_traits::kSmemK4Size);
     float*  const sKsc  = sQsc + Kernel_traits::kBlockM;
-    float*  const sRptr = sKsc + Kernel_traits::kBlockN;
+    float*  const sKsum = sKsc + Kernel_traits::kBlockN;
+    float*  const sRptr = sKsum + Kernel_traits::kBlockN;
     Tensor sR  = make_tensor(make_smem_ptr(sRptr),  typename Kernel_traits::ScoresSmemLayout{});
 
     typename Kernel_traits::GmemTiledCopyQKV gmem_tiled_copy_QKV;
@@ -275,8 +354,9 @@ inline __device__ void compute_attn_int4_1rowblock(const Params &params, const i
     if (!Is_even_K) { __syncthreads(); }
 
     // Quantize Q to packed int4 once (the Q tile does not change across K blocks).
+    // A-operand is uint4 (bias-shift +8 -> [0,15]); no row-sum needed.
     __syncthreads();
-    flash::int4_pack_rows<kBlockM, kHeadDim, kNThreads>(sQ, sQ4ptr, sQsc);
+    flash::int4_pack_rows<kBlockM, kHeadDim, kNThreads, /*QuantizeUnsigned=*/true>(sQ, sQ4ptr, sQsc, nullptr);
     __syncthreads();
 
     int n_block = n_block_max - 1;
@@ -313,41 +393,15 @@ inline __device__ void compute_attn_int4_1rowblock(const Params &params, const i
         cute::cp_async_fence();
 
         // ---------------- INT4-QK stage ----------------
-        int4_pack_rows<kBlockN, kHeadDim, kNThreads>(sK, sK4ptr, sKsc);
+        // B-operand (K) is signed int4 [-8,7]; rowsum accumulates the signed values
+        // for the u4(+8 bias) back-subtraction during dequant.
+        int4_pack_rows<kBlockN, kHeadDim, kNThreads, /*QuantizeUnsigned=*/false>(sK, sK4ptr, sKsc, sKsum);
         __syncthreads();
 
-        // Build the per-thread A/B INT4 fragments and fill them from the packed
-        // byte tiles (sub-byte values), then run the INT4 mma through cute::gemm
-        // exactly like the INT8 kernel's flash::gemm loop.
-        Tensor cA = make_identity_tensor(Shape<Int<kBlockM>, Int<kHeadDim>>{});
-        Tensor tAcA = thr_mma_qk.partition_fragment_A(cA);
-        Tensor cB = make_identity_tensor(Shape<Int<kBlockN>, Int<kHeadDim>>{});
-        Tensor tAcB = thr_mma_qk.partition_fragment_B(cB);
-        Tensor tSrQ4 = make_fragment_like<cute::int4b_t>(tAcA);
-        Tensor tSrK4 = make_fragment_like<cute::int4b_t>(tAcB);
-        flash::fill_int4_fragment<kHeadDimBytes>(tSrQ4, tAcA, sQ4ptr);
-        flash::fill_int4_fragment<kHeadDimBytes>(tSrK4, tAcB, sK4ptr);
-
-        Tensor acc_s8 = partition_fragment_C(tiled_mma_qk, Shape<Int<kBlockM>, Int<kBlockN>>{});
-        clear(acc_s8);
-        // Thread-local register GEMM.  Must pass the INT4 MMA_Atom (TiledMMA's
-        // base, Kernel_traits::TiledMmaQk::Atom) rather than the TiledMMA itself:
-        // cute::gemm's register-geMM overloads only accept an MMA_Atom and do not
-        // deduce through the TiledMMA -> MMA_Atom base class.  Pass the *full*
-        // rank-3 A/B fragments; layout[5] walks the K-mode internally, mirroring
-        // the INT8 kernel's gemm loop.  acc_s8 is used both as the accumulated C
-        // and the output D (D = A*B + C).
-        cute::gemm(typename Kernel_traits::TiledMmaQk::Atom{}, acc_s8, tSrQ4, tSrK4, acc_s8);
-
-        // Dequantize acc_s8 (int32) -> sR (row-major fp32) using per-row scales.
-        Tensor cS = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
-        Tensor tScS = thr_mma_qk.partition_C(cS);
-        #pragma unroll
-        for (int i = 0; i < size(acc_s8); ++i) {
-            const int row = get<0>(tScS(i));
-            const int col = get<1>(tScS(i));
-            sR(row, col) = (float)acc_s8(i) * sQsc[row] * sKsc[col];
-        }
+        // Native Turing m8n8k32 mma (u4×s4, satfinite) -> dequantizes to sR.
+        // No CuTe TiledMMA / MMA_Atom / cute::gemm involved for this stage.
+        flash::int4_qk_native<Kernel_traits>(sRptr, Kernel_traits::kBlockN,
+                                             sQ4ptr, sK4ptr, sQsc, sKsc, sKsum);
 
         __syncthreads();
         if (n_block > n_block_min) {
@@ -403,30 +457,10 @@ inline __device__ void compute_attn_int4_1rowblock(const Params &params, const i
         cute::cp_async_fence();
 
         // ---------------- INT4-QK stage ----------------
-        int4_pack_rows<kBlockN, kHeadDim, kNThreads>(sK, sK4ptr, sKsc);
+        int4_pack_rows<kBlockN, kHeadDim, kNThreads, /*QuantizeUnsigned=*/false>(sK, sK4ptr, sKsc, sKsum);
         __syncthreads();
-
-        Tensor cA = make_identity_tensor(Shape<Int<kBlockM>, Int<kHeadDim>>{});
-        Tensor tAcA = thr_mma_qk.partition_fragment_A(cA);
-        Tensor cB = make_identity_tensor(Shape<Int<kBlockN>, Int<kHeadDim>>{});
-        Tensor tAcB = thr_mma_qk.partition_fragment_B(cB);
-        Tensor tSrQ4 = make_fragment_like<cute::int4b_t>(tAcA);
-        Tensor tSrK4 = make_fragment_like<cute::int4b_t>(tAcB);
-        flash::fill_int4_fragment<kHeadDimBytes>(tSrQ4, tAcA, sQ4ptr);
-        flash::fill_int4_fragment<kHeadDimBytes>(tSrK4, tAcB, sK4ptr);
-
-        Tensor acc_s8 = partition_fragment_C(tiled_mma_qk, Shape<Int<kBlockM>, Int<kBlockN>>{});
-        clear(acc_s8);
-        cute::gemm(typename Kernel_traits::TiledMmaQk::Atom{}, acc_s8, tSrQ4, tSrK4, acc_s8);
-
-        Tensor cS = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
-        Tensor tScS = thr_mma_qk.partition_C(cS);
-        #pragma unroll
-        for (int i = 0; i < size(acc_s8); ++i) {
-            const int row = get<0>(tScS(i));
-            const int col = get<1>(tScS(i));
-            sR(row, col) = (float)acc_s8(i) * sQsc[row] * sKsc[col];
-        }
+        flash::int4_qk_native<Kernel_traits>(sRptr, Kernel_traits::kBlockN,
+                                             sQ4ptr, sK4ptr, sQsc, sKsc, sKsum);
 
         flash::cp_async_wait<0>();
         __syncthreads();

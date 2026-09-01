@@ -1,3 +1,5 @@
+#include <stdlib.h>
+#include <string.h>
 extern "C" {
 #include <ccv.h>
 #include <ccv_internal.h>
@@ -253,14 +255,40 @@ static int _ccv_nnc_scaled_dot_product_attention_forw(const ccv_nnc_cmd_t cmd, c
 		q->info.datatype == CCV_16F && (D == 64 || D == 128 || D == 256) &&
 		props.major == 7 && props.minor == 5 && !is_varlen;
 	if (sm75_qk_eligible) {
-		// INT4 wins when explicitly requested; otherwise INT8-QK (explicit
-		// GEMM_8I or the default when no quantization flag is set).
-		const bool want_int4 = (cmd.info.scaled_dot_product_attention.flags & CCV_NNC_GEMM_4I) != 0;
+		// QK quantization mode is controllable via the CCV_QK_MODE env var
+		// (read once).  Values:
+		//   auto (default / unset): INT4-QK wins when the caller explicitly
+		//     sets CCV_NNC_GEMM_4I; otherwise fall back to INT8-QK.
+		//   int8: force INT8-QK.
+		//   int4: force INT4-QK.
+		//   fp16 / off: disable quantized QK and use the standard FP16 fused
+		//     path (useful for A/B comparison of the int8/int4 improvement).
+		static int sm75_qk_mode = -1;
+		if (sm75_qk_mode < 0) {
+			const char* const qk_mode = getenv("CCV_QK_MODE");
+			if (qk_mode && strcmp(qk_mode, "int8") == 0)
+				sm75_qk_mode = 1;  // force INT8
+			else if (qk_mode && strcmp(qk_mode, "int4") == 0)
+				sm75_qk_mode = 2;  // force INT4
+			else if (qk_mode && (strcmp(qk_mode, "fp16") == 0 || strcmp(qk_mode, "off") == 0))
+				sm75_qk_mode = 3;  // force standard FP16 (no quantized QK)
+			else
+				sm75_qk_mode = 0;  // auto
+		}
 		params.num_splits = 1;  // quantized-QK fused kernel is non-split only
-		if (want_int4)
-			params.is_int4qk = true;
-		else
+		if (sm75_qk_mode == 0) {
+			// auto: INT4 wins when explicitly requested; otherwise INT8-QK
+			// (explicit GEMM_8I or the default when no quantization flag).
+			const bool want_int4 = (cmd.info.scaled_dot_product_attention.flags & CCV_NNC_GEMM_4I) != 0;
+			if (want_int4)
+				params.is_int4qk = true;
+			else
+				params.is_int8qk = true;
+		} else if (sm75_qk_mode == 1) {
 			params.is_int8qk = true;
+		} else if (sm75_qk_mode == 2) {
+			params.is_int4qk = true;
+		}  // mode == 3 => plain FP16 fused path, both flags stay false.
 	}
 #endif
 	if (saved_softmax_lse)

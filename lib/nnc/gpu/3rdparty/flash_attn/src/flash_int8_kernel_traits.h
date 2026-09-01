@@ -80,14 +80,15 @@ struct Flash_int8_kernel_traits : public Base_ {
     using Q8SmemLayout = Layout<Shape<Int<kBlockM>, Int<kHeadDim>>, Stride<Int<kHeadDim>, _1>>;
     using K8SmemLayout = Layout<Shape<Int<kBlockN>, Int<kHeadDim>>, Stride<Int<kHeadDim>, _1>>;
 
-    // ---- fp32 score spill tile (row-major) + per-row INT8 scales. ----
-    // ScoresS is (kBlockM x kBlockN) fp32; Q coefficients are stored scale_q[r]
-    // for each query row, K coefficients scale_k[r] for each key row.
+    // ---- fp32 score spill tile (row-major) + per-block INT8 scales. ----
+    // ScoresS is (kBlockM x kBlockN) fp32; the quantization stores a 2-float
+    // [scale, recip] pair per tile (Q pair + K pair = 4 floats total), one
+    // scale per whole tile exactly like SageAttention's per_block_int8.
     using ScoresSmemLayout = Layout<Shape<Int<kBlockM>, Int<kBlockN>>, Stride<Int<kBlockN>, _1>>;
 
     static constexpr int kSmemQ8Size = size(Q8SmemLayout{}) * sizeof(QKElem);   // bytes
     static constexpr int kSmemK8Size = size(K8SmemLayout{}) * sizeof(QKElem);   // bytes
-    static constexpr int kSmemScaleSize = (kBlockM + kBlockN) * sizeof(float);  // bytes
+    static constexpr int kSmemScaleSize = 4 * sizeof(float);  // [Q scale+recip] + [K scale+recip]
     static constexpr int kSmemScoresSize = size(ScoresSmemLayout{}) * sizeof(float); // bytes
     static constexpr int kSmemSize = Base::kSmemSize
         + kSmemQ8Size + kSmemK8Size + kSmemScaleSize + kSmemScoresSize;

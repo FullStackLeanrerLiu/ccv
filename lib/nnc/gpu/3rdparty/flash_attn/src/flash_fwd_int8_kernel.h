@@ -2,12 +2,14 @@
  * Copyright (c) 2026, ccv.
  *
  * SageAttention-style INT8-QK + FP16-PV flash-attention forward kernel
- * (Turing sm75 only).  Q/K are dynamically quantized to int8, the QK score
- * GEMM runs on Turing's INT8 tensor core (mma.s8.m8n8k16) into an int32
- * accumulator, the result is dequantized (x scale_q * scale_k) to fp32 and
- * spilled through a row-major shared-memory tile, then re-read into the
- * original FP16 C-fragment (`acc_s`) so the unchanged FP16 softmax and FP16
- * PV stage can be reused verbatim.
+ * (Turing sm75 only).  Q/K are dynamically quantized to int8 with per-block
+ * scales (one scale per Q tile and one per K tile — the same granularity as
+ * the community SageAttention per_block_int8 sm75 path, BLK = kBlockM /
+ * kBlockN x D).  The QK score GEMM runs on Turing's INT8 tensor core
+ * (mma.s8.m8n8k16) into an int32 accumulator, the result is dequantized
+ * (x scale_q * scale_k) to fp32 and spilled through a row-major shared-memory
+ * tile, then re-read into the original FP16 C-fragment (`acc_s`) so the
+ * unchanged FP16 softmax and FP16 PV stage can be reused verbatim.
  *
  * This kernel intentionally does NOT modify flash_fwd_kernel.h: the existing
  * FP16 / FP32 (sm75 / sm80) forward kernels and the backward kernels are left
@@ -39,32 +41,60 @@ using namespace cute;
 constexpr float kInt8Range = 127.f;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-// Dynamic per-row INT8 quantization of a tile in shared-memory.
+// Dynamic per-block INT8 quantization of a tile in shared-memory.
 //
-// Each thread owns one entire row (or, when there are fewer rows than threads,
-// multiple rows).  For every row it computes the absmax over the full head
-// dimension, derives scale = absmax / 127, stores it into `scales` (fp32
-// shared memory) and writes Q = round(fp16 * 127 / absmax) clamped to [-128,
-// 127] into the int8 destination tile.  The row layout of `s` is whatever the
-// cute tensor describes (swizzled for the FP16 path); `s8` is plain row-major.
+// One scale is computed for the whole (nRows x HeadDim) tile: a block-wide
+// absmax reduced over all kNThreads threads (warp shuffles + a 1-float smem
+// fold), then scale = absmax / 127 and Q = round(fp16 * 127 / absmax) clamped
+// to [-128, 127] are written.  This mirrors the per_block_int8 granularity of
+// the community SageAttention sm75 path (one scale per BLK x D block, with
+// BLK = kBlockM / kBlockN here) and removes the per-row scale array + per-row
+// divisions of the previous implementation.
+//
+// `scale_out` points at a 2-float smem slot: [0] = scale (absmax/127, or 1.0
+// for a silent tile), [1] = recip (127/absmax, 0 for a silent tile).  The
+// scale pair is written by thread 0 after a block reduction; the trailing
+// __syncthreads() makes it visible to all threads before conversion.
+//
+// `s` may be any (possibly swizzled) FP16 smem tensor; only `s8` is assumed
+// plain row-major.
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 template<int nRows, int HeadDim, int kNThreads, typename F16Tensor>
-__device__ __forceinline__ void int8_quantize_rows(F16Tensor const& s, int8_t* __restrict__ s8,
-                                                   float* __restrict__ scales) {
+__device__ __forceinline__ void int8_quantize_block(F16Tensor const& s, int8_t* __restrict__ s8,
+                                                    float* __restrict__ scale_out) {
+    // ---- 1) block-wide absmax over all nRows x HeadDim elements ----
+    float local = 0.f;
     #pragma unroll 1
-    for (int r = threadIdx.x; r < nRows; r += kNThreads) {
-        float amax = 0.f;
+    for (int r = 0; r < nRows; ++r) {
         #pragma unroll 1
-        for (int j = 0; j < HeadDim; ++j) {
+        for (int j = threadIdx.x; j < HeadDim; j += kNThreads) {
             const float v = (float)s(r, j);
-            amax = fmaxf(amax, fabsf(v));
+            local = fmaxf(local, fabsf(v));
         }
-        const float scale = amax > 1e-12f ? amax / kInt8Range : 1.f;
-        const float inv = amax > 1e-12f ? kInt8Range / amax : 0.f;
-        scales[r] = scale;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        local = fmaxf(local, __shfl_xor_sync(0xffffffffu, local, off));
+    __shared__ float warp_amax[8];  // kNThreads/32 <= 8 warps for all instantiations
+    if ((threadIdx.x & 31) == 0) { warp_amax[threadIdx.x >> 5] = local; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float amax = 0.f;
+        #pragma unroll
+        for (int w = 0; w < kNThreads / 32; ++w) { amax = fmaxf(amax, warp_amax[w]); }
+        const bool has_signal = amax > 1e-12f;
+        scale_out[0] = has_signal ? amax / kInt8Range : 1.f;  // scale
+        scale_out[1] = has_signal ? kInt8Range / amax : 0.f;  // recip = 127 / absmax
+    }
+    __syncthreads();
+
+    // ---- 2) convert + store using the broadcast [scale, recip] pair ----
+    const float inv = scale_out[1];
+    #pragma unroll 1
+    for (int r = 0; r < nRows; ++r) {
         int8_t* const row8 = s8 + r * HeadDim;
         #pragma unroll 1
-        for (int j = 0; j < HeadDim; ++j) {
+        for (int j = threadIdx.x; j < HeadDim; j += kNThreads) {
             const float v = (float)s(r, j) * inv;
             int vi = (int)(v < 0.f ? v - 0.5f : v + 0.5f);
             vi = vi < -128 ? -128 : (vi > 127 ? 127 : vi);
@@ -187,8 +217,8 @@ inline __device__ void compute_attn_int8_1rowblock(const Params &params, const i
     int8_t* const sQ8ptr = reinterpret_cast<int8_t*>(smem_) + Kernel_traits::Base::kSmemSize;
     int8_t* const sK8ptr = sQ8ptr + Kernel_traits::kSmemQ8Size;
     float*  const sQsc  = reinterpret_cast<float*>(sK8ptr + Kernel_traits::kSmemK8Size);
-    float*  const sKsc  = sQsc + Kernel_traits::kBlockM;
-    float*  const sRptr = sKsc + Kernel_traits::kBlockN;
+    float*  const sKsc  = sQsc + 2;   // [scale, recip] per tile (2 floats each)
+    float*  const sRptr = sKsc + 2;
     Tensor sQ8 = make_tensor(make_smem_ptr(sQ8ptr), typename Kernel_traits::Q8SmemLayout{});
     Tensor sK8 = make_tensor(make_smem_ptr(sK8ptr), typename Kernel_traits::K8SmemLayout{});
     Tensor sR  = make_tensor(make_smem_ptr(sRptr),  typename Kernel_traits::ScoresSmemLayout{});
@@ -248,10 +278,11 @@ inline __device__ void compute_attn_int8_1rowblock(const Params &params, const i
                                        binfo.actual_seqlen_q - m_block * kBlockM);
     if (!Is_even_K) { __syncthreads(); }
 
-    // Quantize Q to int8 once (the Q tile does not change across K blocks).
+    // Quantize Q to int8 once (per-block scale is constant across all K blocks).
     __syncthreads();
-    flash::int8_quantize_rows<kBlockM, kHeadDim, kNThreads>(sQ, sQ8ptr, sQsc);
+    flash::int8_quantize_block<kBlockM, kHeadDim, kNThreads>(sQ, sQ8ptr, sQsc);
     __syncthreads();
+    const float sQscale = sQsc[0];   // per-block Q scale (registers after sync)
 
     int n_block = n_block_max - 1;
     flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block), tKsK, tKVcKV, tKVpKV,
@@ -287,8 +318,9 @@ inline __device__ void compute_attn_int8_1rowblock(const Params &params, const i
         cute::cp_async_fence();
 
         // ---------------- INT8-QK stage ----------------
-        int8_quantize_rows<kBlockN, kHeadDim, kNThreads>(sK, sK8ptr, sKsc);
+        flash::int8_quantize_block<kBlockN, kHeadDim, kNThreads>(sK, sK8ptr, sKsc);
         __syncthreads();
+        const float score_scale = sQscale * sKsc[0];   // per-block dequant scale
 
         Tensor tSrQ8 = thr_mma_qk.partition_fragment_A(sQ8);
         Tensor tSrK8 = thr_mma_qk.partition_fragment_B(sK8);
@@ -297,14 +329,14 @@ inline __device__ void compute_attn_int8_1rowblock(const Params &params, const i
         flash::gemm(acc_s8, tSrQ8, tSrK8, tSsQ8, tSsK8, tiled_mma_qk,
                     smem_tiled_copy_Q8, smem_tiled_copy_K8, smem_thr_copy_Q8, smem_thr_copy_K8);
 
-        // Dequantize acc_s8 (int32) -> sR (row-major fp32) using per-row scales.
+        // Dequantize acc_s8 (int32) -> sR (row-major fp32) using the per-block scales.
         Tensor cS = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
         Tensor tScS = thr_mma_qk.partition_C(cS);
         #pragma unroll
         for (int i = 0; i < size(acc_s8); ++i) {
             const int row = get<0>(tScS(i));
             const int col = get<1>(tScS(i));
-            sR(row, col) = (float)acc_s8(i) * sQsc[row] * sKsc[col];
+            sR(row, col) = (float)acc_s8(i) * score_scale;
         }
 
         __syncthreads();
@@ -361,8 +393,9 @@ inline __device__ void compute_attn_int8_1rowblock(const Params &params, const i
         cute::cp_async_fence();
 
         // ---------------- INT8-QK stage ----------------
-        int8_quantize_rows<kBlockN, kHeadDim, kNThreads>(sK, sK8ptr, sKsc);
+        flash::int8_quantize_block<kBlockN, kHeadDim, kNThreads>(sK, sK8ptr, sKsc);
         __syncthreads();
+        const float score_scale = sQscale * sKsc[0];   // per-block dequant scale
 
         Tensor tSrQ8 = thr_mma_qk.partition_fragment_A(sQ8);
         Tensor tSrK8 = thr_mma_qk.partition_fragment_B(sK8);
@@ -371,13 +404,14 @@ inline __device__ void compute_attn_int8_1rowblock(const Params &params, const i
         flash::gemm(acc_s8, tSrQ8, tSrK8, tSsQ8, tSsK8, tiled_mma_qk,
                     smem_tiled_copy_Q8, smem_tiled_copy_K8, smem_thr_copy_Q8, smem_thr_copy_K8);
 
+        // Dequantize acc_s8 (int32) -> sR (row-major fp32) using the per-block scales.
         Tensor cS = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
         Tensor tScS = thr_mma_qk.partition_C(cS);
         #pragma unroll
         for (int i = 0; i < size(acc_s8); ++i) {
             const int row = get<0>(tScS(i));
             const int col = get<1>(tScS(i));
-            sR(row, col) = (float)acc_s8(i) * sQsc[row] * sKsc[col];
+            sR(row, col) = (float)acc_s8(i) * score_scale;
         }
 
         flash::cp_async_wait<0>();

@@ -293,11 +293,9 @@ static int _ccv_nnc_scaled_dot_product_attention_forw(const ccv_nnc_cmd_t cmd, c
 			else if (want_int8)
 				params.is_int8qk = true;
 		} else if (sm75_qk_mode == 1) {
-			params.is_int8qk = true;
-			fprintf(stderr, "[SDPA] CCV_QK_MODE=int8: EXPERIMENTAL INT8-QK path engaged; verify image quality.\n");
+			params.is_int8qk = true;  // experimental INT8-QK
 		} else if (sm75_qk_mode == 2) {
-			params.is_int4qk = true;
-			fprintf(stderr, "[SDPA] CCV_QK_MODE=int4: EXPERIMENTAL INT4-QK path engaged; verify image quality.\n");
+			params.is_int4qk = true;  // experimental INT4-QK
 		}  // mode == 3 or auto => plain FP16 fused path, both flags stay false.
 		// fp16-SageAttention tile variant — only when no quantized path was
 		// explicitly requested.
@@ -307,8 +305,7 @@ static int _ccv_nnc_scaled_dot_product_attention_forw(const ccv_nnc_cmd_t cmd, c
 			sm75_sega_mode = sega_mode && strcmp(sega_mode, "fp16") == 0 ? 1 : 0;
 		}
 		if (sm75_sega_mode && !params.is_int8qk && !params.is_int4qk) {
-			params.is_sega_fp16 = true;
-			fprintf(stderr, "[SDPA] CCV_SEGA_MODE=fp16: fp16-SageAttention tile variant engaged.\n");
+			params.is_sega_fp16 = true;  // fp16-SageAttention tile variant
 		}
 	}
 #endif

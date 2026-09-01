@@ -223,7 +223,21 @@ struct Flash_fwd_params : public Qkv_params {
     // inputs and head dims in {64, 128, 256}, non-varlen.  Takes priority over
     // is_int8qk when both are requested; otherwise the standard FP16 kernel is
     // used.  Leave false (default) to run the existing paths unchanged.
+    //
+    // NOTE: both the INT4-QK and INT8-QK paths are EXPERIMENTAL on Turing:
+    // their fixed quantize/dequantize + shared-memory overhead outweighs the
+    // INT8/INT4 MMA throughput on the small attention tiles used by inference,
+    // and the INT8 path currently produces incorrect (blocky) results.  They
+    // are only enabled when CCV_QK_MODE explicitly requests them.
     bool is_int4qk;
+
+    // When set (CCV_SEGA_MODE=fp16), the sm75 fp16 fused path runs the
+    // "fp16-SageAttention-style" tuning variant: the same FP16 tensor-core
+    // QK + FP16 PV fusion, launched with a SageAttention-flavored tile config
+    // for A/B comparison against the default FP16 fused path.  Only valid for
+    // fp16 inputs, head dims in {64, 128, 256}, non-varlen, and takes a lower
+    // priority than the (explicitly requested) int4/int8 quantized-QK paths.
+    bool is_sega_fp16;
 
     // If is_seqlens_k_cumulative, then seqlen_k is cu_seqlens_k[bidb + 1] - cu_seqlens_k[bidb].
     // Otherwise it's cu_seqlens_k[bidb], i.e., we use cu_seqlens_k to store the sequence lengths of K.
@@ -285,5 +299,6 @@ template<typename T, int Headdim> void run_mha_fwd_(Flash_fwd_params &params, cu
 template<typename T, int Headdim> void run_mha_fwd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t stream);
 template<typename T, int Headdim> void run_mha_fwd_int8_(Flash_fwd_params &params, cudaStream_t stream);
 template<typename T, int Headdim> void run_mha_fwd_int4_(Flash_fwd_params &params, cudaStream_t stream);
+template<typename T, int Headdim> void run_mha_fwd_segafp16_(Flash_fwd_params &params, cudaStream_t stream);
 
 template<typename T, int Headdim> void run_mha_bwd_(Flash_bwd_params &params, cudaStream_t stream);

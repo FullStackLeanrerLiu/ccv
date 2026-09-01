@@ -18,6 +18,8 @@
 
 #pragma once
 
+#include <cstdint>
+
 #include <cute/algorithm/copy.hpp>
 
 #include <cutlass/cutlass.h>
@@ -39,6 +41,67 @@ using namespace cute;
 
 // Range used by the symmetric (zero-point = 0) INT8 quantizer.
 constexpr float kInt8Range = 127.f;
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Hand-written INT8-QK GEMM (Turing mma.m8n8k16), SageAttention-sm75 style.
+//
+// WHY not the cute TiledMMA path: cute's SM75 copy atom is a 16-bit LDSM /
+// swizzled smem layout, but the int8 Q/K tiles here are plain row-major
+// (1 byte/elt, no swizzle).  Driving cute's fused load+mma on the wrong smem
+// geometry silently mis-indexes the operands, which produced the blocky /
+// incorrect images seen on 2080 Ti.  We therefore bypass cute entirely and:
+//   * load each thread's A/B operand as a single uint32_t (4 packed int8) from
+//     row-major smem via a plain 32-bit read (4-byte aligned),
+//   * run mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 by hand,
+//   * write the dequantized fp32 scores straight into the row-major sR tile.
+// The PV stage below is unchanged and still uses the FP16 tensor core
+// (SM75_16x8x8, m16n8k8) — NOT the INT8 m8n8k16.
+
+// Turing m8n8k16 operand layout (PTX):
+//   A (8x16 int8) per warp: thread t owns row t/4, k cols [(t%4)*4, (t%4)*4+4)
+//   B (8x16 int8) per warp: thread t owns row t/4 (N dim), k cols [(t%4)*4, +4]
+//   C (8x8  int32): thread t owns row t/4, cols (t%4)*2  and (t%4)*2+1
+//
+// The warp grid mirrors the layout of the cute TiledMmaQk we replaced:
+// kNWarps warps are laid out along the M axis, each covering a kBlockM/kNWarps
+// row slab; slabs of 8 rows are processed per mma, stepping by 8*kNWarps so
+// every row of the (kBlockM x kBlockN) score tile is written exactly once.
+template<int kBlockM, int kBlockN, int kHeadDim, int kNWarps>
+__device__ __forceinline__ void int8_cute_bypass_gemm(
+    int8_t const* __restrict__ sQ8, int8_t const* __restrict__ sK8,
+    float* __restrict__ sR, const float score_scale, const int tidx) {
+    static_assert(kBlockM % 8 == 0, "kBlockM must be a multiple of 8");
+    static_assert(kBlockN % 8 == 0, "kBlockN must be a multiple of 8");
+    static_assert(kHeadDim % 16 == 0, "kHeadDim must be a multiple of 16");
+    const int warp  = tidx / 32;
+    const int m8    = (tidx % 32) / 4;                  // 0..7 within the 8x8 C block
+    const int kgrp  = (tidx % 32) % 4;                  // 0..3  k-group (4 int8 / operand)
+    #pragma unroll
+    for (int mb = warp * 8; mb < kBlockM; mb += 8 * kNWarps) {   // M slab of 8 rows / warp
+        #pragma unroll
+        for (int nb = 0; nb < kBlockN / 8; ++nb) {              // 8-column C blocks
+            int32_t acc0 = 0, acc1 = 0;
+            #pragma unroll
+            for (int kk = 0; kk < kHeadDim / 16; ++kk) {        // K in chunks of 16
+                const int koff = kk * 16 + kgrp * 4;
+                const uint32_t a0 = *reinterpret_cast<const uint32_t*>(
+                    sQ8 + (mb + m8) * kHeadDim + koff);
+                const uint32_t b0 = *reinterpret_cast<const uint32_t*>(
+                    sK8 + (nb * 8 + m8) * kHeadDim + koff);
+                asm volatile(
+                    "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
+                    "{%0, %1}, {%2}, {%3}, {%0, %1};\n"
+                    : "+r"(acc0), "+r"(acc1)
+                    : "r"(a0), "r"(b0));
+            }
+            // Dequantize and spill to the row-major fp32 score tile.
+            const int row = mb + m8;
+            const int col = nb * 8 + kgrp * 2;
+            sR[row * kBlockN + col]     = (float)acc0 * score_scale;
+            sR[row * kBlockN + col + 1] = (float)acc1 * score_scale;
+        }
+    }
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // Dynamic per-block INT8 quantization of a tile in shared-memory.
@@ -211,16 +274,11 @@ inline __device__ void compute_attn_int8_1rowblock(const Params &params, const i
     Tensor sVtNoSwizzle = make_tensor(sV.data(), typename Kernel_traits::SmemLayoutVtransposedNoSwizzle{});
 
     // ---- INT8 buffers, allocated right after the FP16 Q/K/V smem region. ----
-    typename Kernel_traits::TiledMmaQk tiled_mma_qk;
-    auto thr_mma_qk = tiled_mma_qk.get_thread_slice(tidx);
-
     int8_t* const sQ8ptr = reinterpret_cast<int8_t*>(smem_) + Kernel_traits::Base::kSmemSize;
     int8_t* const sK8ptr = sQ8ptr + Kernel_traits::kSmemQ8Size;
     float*  const sQsc  = reinterpret_cast<float*>(sK8ptr + Kernel_traits::kSmemK8Size);
     float*  const sKsc  = sQsc + 2;   // [scale, recip] per tile (2 floats each)
     float*  const sRptr = sKsc + 2;
-    Tensor sQ8 = make_tensor(make_smem_ptr(sQ8ptr), typename Kernel_traits::Q8SmemLayout{});
-    Tensor sK8 = make_tensor(make_smem_ptr(sK8ptr), typename Kernel_traits::K8SmemLayout{});
     Tensor sR  = make_tensor(make_smem_ptr(sRptr),  typename Kernel_traits::ScoresSmemLayout{});
 
     typename Kernel_traits::GmemTiledCopyQKV gmem_tiled_copy_QKV;
@@ -240,15 +298,6 @@ inline __device__ void compute_attn_int8_1rowblock(const Params &params, const i
     Tensor tOrVt = thr_mma.partition_fragment_B(sVtNoSwizzle);
     Tensor tSgS = thr_mma.partition_C(gP);
     Tensor acc_o = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kHeadDim>>{});
-
-    // INT8 QK smem copy atoms.  Use a plain DefaultCopy: the int8 Q/K tiles are
-    // simple row-major (no 16-bit LDSM swizzle needed for the m8n8k16 instruction).
-    auto smem_tiled_copy_Q8 = make_tiled_copy_A(Copy_Atom<DefaultCopy, typename Kernel_traits::QKElem>{}, tiled_mma_qk);
-    auto smem_thr_copy_Q8 = smem_tiled_copy_Q8.get_thread_slice(tidx);
-    Tensor tSsQ8 = smem_thr_copy_Q8.partition_S(sQ8);
-    auto smem_tiled_copy_K8 = make_tiled_copy_B(Copy_Atom<DefaultCopy, typename Kernel_traits::QKElem>{}, tiled_mma_qk);
-    auto smem_thr_copy_K8 = smem_tiled_copy_K8.get_thread_slice(tidx);
-    Tensor tSsK8 = smem_thr_copy_K8.partition_S(sK8);
 
     // FP16 smem tiled copies (still needed for the PV stage).
     auto smem_tiled_copy_V = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtomTransposed{}, tiled_mma);
@@ -322,23 +371,11 @@ inline __device__ void compute_attn_int8_1rowblock(const Params &params, const i
         __syncthreads();
         const float score_scale = sQscale * sKsc[0];   // per-block dequant scale
 
-        Tensor tSrQ8 = thr_mma_qk.partition_fragment_A(sQ8);
-        Tensor tSrK8 = thr_mma_qk.partition_fragment_B(sK8);
-        Tensor acc_s8 = partition_fragment_C(tiled_mma_qk, Shape<Int<kBlockM>, Int<kBlockN>>{});
-        clear(acc_s8);
-        flash::gemm(acc_s8, tSrQ8, tSrK8, tSsQ8, tSsK8, tiled_mma_qk,
-                    smem_tiled_copy_Q8, smem_tiled_copy_K8, smem_thr_copy_Q8, smem_thr_copy_K8);
-
-        // Dequantize acc_s8 (int32) -> sR (row-major fp32) using the per-block scales.
-        Tensor cS = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
-        Tensor tScS = thr_mma_qk.partition_C(cS);
-        #pragma unroll
-        for (int i = 0; i < size(acc_s8); ++i) {
-            const int row = get<0>(tScS(i));
-            const int col = get<1>(tScS(i));
-            sR(row, col) = (float)acc_s8(i) * score_scale;
-        }
-
+        // Hand-written m8n8k16 GEMM: uint32_t manual loads from the plain
+        // row-major int8 smem tiles, dequant + spill straight into sR.
+        flash::int8_cute_bypass_gemm<kBlockM, kBlockN, kHeadDim, kNWarps>(
+            sQ8ptr, sK8ptr, sRptr, score_scale, tidx
+        );
         __syncthreads();
         if (n_block > n_block_min) {
             flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - 1), tKsK, tKVcKV, tKVpKV);
@@ -397,22 +434,12 @@ inline __device__ void compute_attn_int8_1rowblock(const Params &params, const i
         __syncthreads();
         const float score_scale = sQscale * sKsc[0];   // per-block dequant scale
 
-        Tensor tSrQ8 = thr_mma_qk.partition_fragment_A(sQ8);
-        Tensor tSrK8 = thr_mma_qk.partition_fragment_B(sK8);
-        Tensor acc_s8 = partition_fragment_C(tiled_mma_qk, Shape<Int<kBlockM>, Int<kBlockN>>{});
-        clear(acc_s8);
-        flash::gemm(acc_s8, tSrQ8, tSrK8, tSsQ8, tSsK8, tiled_mma_qk,
-                    smem_tiled_copy_Q8, smem_tiled_copy_K8, smem_thr_copy_Q8, smem_thr_copy_K8);
-
-        // Dequantize acc_s8 (int32) -> sR (row-major fp32) using the per-block scales.
-        Tensor cS = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
-        Tensor tScS = thr_mma_qk.partition_C(cS);
-        #pragma unroll
-        for (int i = 0; i < size(acc_s8); ++i) {
-            const int row = get<0>(tScS(i));
-            const int col = get<1>(tScS(i));
-            sR(row, col) = (float)acc_s8(i) * score_scale;
-        }
+        // Hand-written m8n8k16 GEMM: uint32_t manual loads from the plain
+        // row-major int8 smem tiles, dequant + spill straight into sR.
+        flash::int8_cute_bypass_gemm<kBlockM, kBlockN, kHeadDim, kNWarps>(
+            sQ8ptr, sK8ptr, sRptr, score_scale, tidx
+        );
+        __syncthreads();
 
         flash::cp_async_wait<0>();
         __syncthreads();

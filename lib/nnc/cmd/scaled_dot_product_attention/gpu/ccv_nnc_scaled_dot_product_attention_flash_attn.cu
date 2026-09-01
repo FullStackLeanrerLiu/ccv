@@ -249,46 +249,67 @@ static int _ccv_nnc_scaled_dot_product_attention_forw(const ccv_nnc_cmd_t cmd, c
 	// SageAttention-style quantized-QK fusion for Turing (sm75 / RTX 2080 Ti):
 	// fp16 inputs, head dim in {64,128,256}, non-varlen, compute 7.5.  The
 	// quantized-QK path is non-split only, so the split-kv heuristic is overridden
-	// to 1.  Explicit INT4/INT8 flags from the caller win; otherwise (drawthings
-	// never sets them) we default to INT8-QK on the fp16 fused path for speed.
+	// to 1.
+	//
+	// DISPATCH SEMANTICS (CCV_QK_MODE):
+	//   auto  (default / unset): STANDARD FP16 fused path.  On Turing the
+	//         INT8/INT4-QK variants are EXPERIMENTAL: fixed quantize/dequant +
+	//         smem overhead eats the INT8/INT4 MMA gain on the small attention
+	//         tiles used in inference, and the INT8 path historically produced
+	//         incorrect images.  auto therefore does NOT engage them anymore.
+	//   int8  : force the INT8-QK kernel (experimental — verify image quality).
+	//   int4  : force the INT4-QK kernel (experimental — verify image quality).
+	//   fp16 / off: standard FP16 fused path (A/B baseline).
+	// Additionally CCV_SEGA_MODE=fp16 engages the fp16-SageAttention tile
+	// variant (params.is_sega_fp16), an A/B tuning knob on the pure-FP16 path.
+	// CCV_SEGA_MODE takes a LOWER priority than an explicitly requested
+	// quantized CCV_QK_MODE.
 	const bool sm75_qk_eligible =
 		q->info.datatype == CCV_16F && (D == 64 || D == 128 || D == 256) &&
 		props.major == 7 && props.minor == 5 && !is_varlen;
 	if (sm75_qk_eligible) {
-		// QK quantization mode is controllable via the CCV_QK_MODE env var
-		// (read once).  Values:
-		//   auto (default / unset): INT4-QK wins when the caller explicitly
-		//     sets CCV_NNC_GEMM_4I; otherwise fall back to INT8-QK.
-		//   int8: force INT8-QK.
-		//   int4: force INT4-QK.
-		//   fp16 / off: disable quantized QK and use the standard FP16 fused
-		//     path (useful for A/B comparison of the int8/int4 improvement).
 		static int sm75_qk_mode = -1;
 		if (sm75_qk_mode < 0) {
 			const char* const qk_mode = getenv("CCV_QK_MODE");
 			if (qk_mode && strcmp(qk_mode, "int8") == 0)
-				sm75_qk_mode = 1;  // force INT8
+				sm75_qk_mode = 1;  // force INT8-QK (EXPERIMENTAL)
 			else if (qk_mode && strcmp(qk_mode, "int4") == 0)
-				sm75_qk_mode = 2;  // force INT4
+				sm75_qk_mode = 2;  // force INT4-QK (EXPERIMENTAL)
 			else if (qk_mode && (strcmp(qk_mode, "fp16") == 0 || strcmp(qk_mode, "off") == 0))
 				sm75_qk_mode = 3;  // force standard FP16 (no quantized QK)
 			else
-				sm75_qk_mode = 0;  // auto
+				sm75_qk_mode = 0;  // auto => standard FP16 fused path
 		}
 		params.num_splits = 1;  // quantized-QK fused kernel is non-split only
 		if (sm75_qk_mode == 0) {
-			// auto: INT4 wins when explicitly requested; otherwise INT8-QK
-			// (explicit GEMM_8I or the default when no quantization flag).
+			// auto (default): standard FP16 fused path.  The quantized-QK paths
+			// are experimental on Turing; engage them only when explicitly named.
+			// We still honor an explicit GEMM_4I / GEMM_8I flag so callers that
+			// deliberately ask for a quantized attention can get one.
+			const bool want_int8 = (cmd.info.scaled_dot_product_attention.flags & CCV_NNC_GEMM_8I) != 0;
 			const bool want_int4 = (cmd.info.scaled_dot_product_attention.flags & CCV_NNC_GEMM_4I) != 0;
 			if (want_int4)
 				params.is_int4qk = true;
-			else
+			else if (want_int8)
 				params.is_int8qk = true;
 		} else if (sm75_qk_mode == 1) {
 			params.is_int8qk = true;
+			fprintf(stderr, "[SDPA] CCV_QK_MODE=int8: EXPERIMENTAL INT8-QK path engaged; verify image quality.\n");
 		} else if (sm75_qk_mode == 2) {
 			params.is_int4qk = true;
-		}  // mode == 3 => plain FP16 fused path, both flags stay false.
+			fprintf(stderr, "[SDPA] CCV_QK_MODE=int4: EXPERIMENTAL INT4-QK path engaged; verify image quality.\n");
+		}  // mode == 3 or auto => plain FP16 fused path, both flags stay false.
+		// fp16-SageAttention tile variant — only when no quantized path was
+		// explicitly requested.
+		static int sm75_sega_mode = -1;
+		if (sm75_sega_mode < 0) {
+			const char* const sega_mode = getenv("CCV_SEGA_MODE");
+			sm75_sega_mode = sega_mode && strcmp(sega_mode, "fp16") == 0 ? 1 : 0;
+		}
+		if (sm75_sega_mode && !params.is_int8qk && !params.is_int4qk) {
+			params.is_sega_fp16 = true;
+			fprintf(stderr, "[SDPA] CCV_SEGA_MODE=fp16: fp16-SageAttention tile variant engaged.\n");
+		}
 	}
 #endif
 	if (saved_softmax_lse)
@@ -316,8 +337,8 @@ static int _ccv_nnc_scaled_dot_product_attention_forw(const ccv_nnc_cmd_t cmd, c
 		static bool s_diag2 = false;
 		if (!s_diag2) {
 			s_diag2 = true;
-			fprintf(stderr, "[SDPA-DIAG] dispatch: int8=%d int4=%d splits=%d D=%d bf16=%d\n",
-				(int)params.is_int8qk, (int)params.is_int4qk, params.num_splits, D, (int)params.is_bf16);
+			fprintf(stderr, "[SDPA-DIAG] dispatch: int8=%d int4=%d sega_fp16=%d splits=%d D=%d bf16=%d\n",
+				(int)params.is_int8qk, (int)params.is_int4qk, (int)params.is_sega_fp16, params.num_splits, D, (int)params.is_bf16);
 		}
 	}
 	// --- END DIAG(2) ---

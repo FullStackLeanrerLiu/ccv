@@ -12,10 +12,15 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split
 #ifdef HAVE_CUDA_SM75
     // sm75 (Turing) builds have FP16 fwd + fwd_split kernels only: bf16 MMA is
     // Ampere-only, so we instantiate the half_t path directly without FP16_SWITCH.
-    // When a quantized-QK path is requested we dispatch to the INT4-QK (native
-    // INT4 tensor core) or INT8-QK kernel for the supported head dims {64,128,256}
-    // (fp16 inputs, non-split only); any other dim / split falls back to the
-    // standard FP16 path untouched. INT4-QK is preferred over INT8-QK.
+    //
+    // Dispatch order on Turing:
+    //   1. INT4-QK / INT8-QK quantized paths — EXPERIMENTAL, only when explicitly
+    //      requested via CCV_QK_MODE=int4 / int8 (params.is_int4qk / is_int8qk).
+    //      They use Turing's native INT4 (m8n8k32) / INT8 (m8n8k16) tensor cores
+    //      for QK and the FP16 tensor core (m16n8k8) for PV.
+    //   2. fp16-SageAttention tuning variant (CCV_SEGA_MODE=fp16) — FP16 QK + FP16
+    //      PV fusion with a SageAttention-flavored tile config for A/B.
+    //   3. Standard FP16 fused path (default).
     if (!force_split_kernel && params.num_splits <= 1 &&
         (params.is_int4qk || params.is_int8qk)) {
         const bool use_int4 = params.is_int4qk;
@@ -28,6 +33,18 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split
         } else if (params.d <= 256) {
             if (use_int4) { run_mha_fwd_int4_<cutlass::half_t, 256>(params, stream); }
             else          { run_mha_fwd_int8_<cutlass::half_t, 256>(params, stream); }
+        } else {
+            HEADDIM_SWITCH(params.d, [&] {
+                run_mha_fwd_<cutlass::half_t, kHeadDim>(params, stream);
+            });
+        }
+    } else if (!force_split_kernel && params.num_splits <= 1 && params.is_sega_fp16) {
+        if (params.d <= 64) {
+            run_mha_fwd_segafp16_<cutlass::half_t, 64>(params, stream);
+        } else if (params.d <= 128) {
+            run_mha_fwd_segafp16_<cutlass::half_t, 128>(params, stream);
+        } else if (params.d <= 256) {
+            run_mha_fwd_segafp16_<cutlass::half_t, 256>(params, stream);
         } else {
             HEADDIM_SWITCH(params.d, [&] {
                 run_mha_fwd_<cutlass::half_t, kHeadDim>(params, stream);

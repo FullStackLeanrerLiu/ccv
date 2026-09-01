@@ -43,6 +43,13 @@ INT4_KERNEL_IMPL_TEMPLATE_FWD = """#include "flash_fwd_int4_launch_template.h"
 template void run_mha_fwd_int4_<{DTYPE}, {HEAD_DIM}>(Flash_fwd_params &params, cudaStream_t stream);
 """
 
+# fp16-SageAttention tile variant (Turing sm75): pure-FP16 QK+PV fused kernel
+# launched with a SageAttention-flavored block shape for A/B tuning.
+SEGAFP16_KERNEL_IMPL_TEMPLATE_FWD = """#include "flash_fwd_segafp16_launch_template.h"
+
+template void run_mha_fwd_segafp16_<{DTYPE}, {HEAD_DIM}>(Flash_fwd_params &params, cudaStream_t stream);
+"""
+
 # Head dimensions for which the int8-QK / int4-QK paths are available (sm75 / Turing).
 INT8_HEAD_DIMENSIONS = [64, 128, 256]
 INT4_HEAD_DIMENSIONS = [64, 128, 256]
@@ -64,9 +71,14 @@ class Kernel:
     direction: str
     is_int8: bool = False
     is_int4: bool = False
+    is_segafp16: bool = False
 
     @property
     def template(self) -> str:
+        if self.is_segafp16:
+            return SEGAFP16_KERNEL_IMPL_TEMPLATE_FWD.format(
+                DTYPE=DTYPE_MAP[self.dtype], HEAD_DIM=self.head_dim
+            )
         if self.is_int4:
             return INT4_KERNEL_IMPL_TEMPLATE_FWD.format(
                 DTYPE=DTYPE_MAP[self.dtype], HEAD_DIM=self.head_dim
@@ -90,6 +102,8 @@ class Kernel:
 
     @property
     def filename(self) -> str:
+        if self.is_segafp16:
+            return f"flash_fwd_segafp16_hdim{self.head_dim}_sm{self.sm}.cu"
         if self.is_int8:
             return f"flash_fwd_int8_hdim{self.head_dim}_sm{self.sm}.cu"
         if self.is_int4:
@@ -114,6 +128,9 @@ def get_all_kernels() -> List[Kernel]:
     # fp16 inputs only.
     for head_dim in INT4_HEAD_DIMENSIONS:
         yield Kernel(sm=75, dtype="fp16", head_dim=head_dim, direction="fwd", is_int4=True)
+    # sm75 fp16-SageAttention tile variants (pure-FP16 QK+PV fusion), fp16 only.
+    for head_dim in INT8_HEAD_DIMENSIONS:
+        yield Kernel(sm=75, dtype="fp16", head_dim=head_dim, direction="fwd", is_segafp16=True)
 
 
 def write_kernel(kernel: Kernel, autogen_dir: Path) -> None:

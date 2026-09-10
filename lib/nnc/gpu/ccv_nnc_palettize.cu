@@ -1269,7 +1269,7 @@ __global__ void _ccv_nnc_qx_int8_col_write(const uint8_t* const a, const size_t 
 	}
 }
 
-int ccv_nnc_compat_decode_qx_int8_colwise(const void* input, const ccv_nnc_tensor_param_t params, void* output_i8, void* output_scale, const size_t row_len, const bool scale_along_rows, ccv_nnc_stream_context_t* const stream_context)
+int ccv_nnc_compat_decode_qx_int8_colwise(const void* input, const ccv_nnc_tensor_param_t params, void* output_i8, void* output_scale, const size_t row_len, const int scale_along_rows, ccv_nnc_stream_context_t* const stream_context)
 {
 	assert(CCV_GET_DATA_TYPE(params.datatype) == CCV_QX);
 	const int subtype = params.datatype & 0xf00;
@@ -1288,11 +1288,11 @@ int ccv_nnc_compat_decode_qx_int8_colwise(const void* input, const ccv_nnc_tenso
 	int* const col_max_bits = (int*)ccv_nnc_stream_context_get_workspace(stream_context, col_count * sizeof(int), CCV_TENSOR_GPU_MEMORY);
 	CUDA_ENFORCE(cudaMemsetAsync(col_max_bits, 0, col_count * sizeof(int), stream));
 	if (qbits == 6) {
-		_ccv_nnc_qx_int8_col_max<6><<<CUDA_GET_BLOCKS(count), CUDA_NUM_THREADS, 0, stream>>>(input, count, row_len, scale_along_rows, number_in_blocks, col_max_bits);
-		_ccv_nnc_qx_int8_col_write<6><<<CUDA_GET_BLOCKS(count), CUDA_NUM_THREADS, 0, stream>>>(input, count, row_len, scale_along_rows, number_in_blocks, col_max_bits, (int8_t*)output_i8, (__half*)output_scale);
+		_ccv_nnc_qx_int8_col_max<6><<<CUDA_GET_BLOCKS(count), CUDA_NUM_THREADS, 0, stream>>>((const uint8_t*)input, count, row_len, scale_along_rows, number_in_blocks, col_max_bits);
+		_ccv_nnc_qx_int8_col_write<6><<<CUDA_GET_BLOCKS(count), CUDA_NUM_THREADS, 0, stream>>>((const uint8_t*)input, count, row_len, scale_along_rows, number_in_blocks, col_max_bits, (int8_t*)output_i8, (__half*)output_scale);
 	} else {
-		_ccv_nnc_qx_int8_col_max<8><<<CUDA_GET_BLOCKS(count), CUDA_NUM_THREADS, 0, stream>>>(input, count, row_len, scale_along_rows, number_in_blocks, col_max_bits);
-		_ccv_nnc_qx_int8_col_write<8><<<CUDA_GET_BLOCKS(count), CUDA_NUM_THREADS, 0, stream>>>(input, count, row_len, scale_along_rows, number_in_blocks, col_max_bits, (int8_t*)output_i8, (__half*)output_scale);
+		_ccv_nnc_qx_int8_col_max<8><<<CUDA_GET_BLOCKS(count), CUDA_NUM_THREADS, 0, stream>>>((const uint8_t*)input, count, row_len, scale_along_rows, number_in_blocks, col_max_bits);
+		_ccv_nnc_qx_int8_col_write<8><<<CUDA_GET_BLOCKS(count), CUDA_NUM_THREADS, 0, stream>>>((const uint8_t*)input, count, row_len, scale_along_rows, number_in_blocks, col_max_bits, (int8_t*)output_i8, (__half*)output_scale);
 	}
 	return 0;
 }

@@ -374,9 +374,9 @@ static int _ccv_nnc_scaled_dot_product_attention_forw(const ccv_nnc_cmd_t cmd, c
 		if (!s_diag2) {
 			s_diag2 = true;
 #ifdef HAVE_CUDA_SM75
-			fprintf(stderr, "[SDPA-DIAG] dispatch: int8=%d int4=%d sega_fp16=%d splits=%d D=%d bf16=%d R=%d C=%d qk_min_tile=%d tile_large=%d\n",
+			fprintf(stderr, "[SDPA-DIAG] dispatch: int8=%d int4=%d sega_fp16=%d splits=%d D=%d bf16=%d qk_elig=%d R=%d C=%d\n",
 				(int)params.is_int8qk, (int)params.is_int4qk, (int)params.is_sega_fp16, params.num_splits, D, (int)params.is_bf16,
-				R, C, sm75_qk_eligible ? sm75_qk_min_tile : 0, sm75_qk_eligible ? (int)qk_tile_large_enough : 0);
+				(int)sm75_qk_eligible, R, C);
 #else
 			fprintf(stderr, "[SDPA-DIAG] dispatch: int8=%d int4=%d sega_fp16=%d splits=%d D=%d bf16=%d\n",
 				(int)params.is_int8qk, (int)params.is_int4qk, (int)params.is_sega_fp16, params.num_splits, D, (int)params.is_bf16);

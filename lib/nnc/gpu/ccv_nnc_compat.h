@@ -70,7 +70,7 @@ void ccv_nnc_compat_decode_qx(const void* input, const ccv_nnc_tensor_param_t pa
 // buffer plus one FP16 scale per output-feature column (axis chosen by
 // scale_along_rows). Returns 0 on success, nonzero if the format is not
 // supported (caller should fall back to the FP16 decode path).
-int ccv_nnc_compat_decode_qx_int8_colwise(const void* input, const ccv_nnc_tensor_param_t params, void* output_i8, void* output_scale, const size_t row_len, const bool scale_along_rows, ccv_nnc_stream_context_t* const stream_context);
+int ccv_nnc_compat_decode_qx_int8_colwise(const void* input, const ccv_nnc_tensor_param_t params, void* output_i8, void* output_scale, const size_t row_len, const int scale_along_rows, ccv_nnc_stream_context_t* const stream_context);
 void ccv_nnc_tensor_prefetch_async(ccv_nnc_tensor_t* const tensor, const ccv_nnc_stream_context_t* const stream_context);
 #ifdef __cplusplus
 }

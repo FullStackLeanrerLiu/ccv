@@ -128,6 +128,78 @@ static __global__ void dequantize_mul_mat_vec_add_bias(const half* __restrict__ 
 	}
 }
 
+// ---- W8A8 INT8 GEMM (SM75 experimental) ----
+//
+// When CCV_GEMM_INT8=1 and a q6p/q8p palette weight GEMM is large enough, we
+// skip the FP16 decode entirely: the palette is decoded straight to INT8 (one
+// byte per element + one FP16 scale per output feature), the FP16 activation is
+// quantized per-row to INT8, cuBLAS runs an INT8 tensor-core GEMM with INT32
+// accumulate (CUBLAS_COMPUTE_32I), and a final epilogue applies the per-row /
+// per-output-feature scales (and bias) back to FP16.  Everything else falls
+// back to the regular FP16 decode path.
+
+static int _ccv_nnc_gemm_int8_enabled(void)
+{
+	static int cached = -1;
+	if (cached < 0)
+	{
+		const char* const v = getenv("CCV_GEMM_INT8");
+		cached = v ? (atoi(v) != 0) : 0;
+	}
+	return cached;
+}
+
+static int _ccv_nnc_gemm_int8_min_tile(void)
+{
+	static int cached = -1;
+	if (cached < 0)
+	{
+		const char* const v = getenv("CCV_GEMM_INT8_MIN_TILE");
+		cached = v ? atoi(v) : 65536; // K * N threshold, 256x256 default
+		if (cached <= 0)
+			cached = 1;
+	}
+	return cached;
+}
+
+// Pass 1: per-row max |activation| (float bits are monotonically ordered for
+// non-negative floats, so atomicMax on __float_as_int(fabsf(v)) works, init 0).
+static __global__ void _ccv_nnc_gemm_i8_rowmax(const half* const __restrict__ a, const int rows, const int cols, int* const __restrict__ row_max_bits)
+{
+	CUDA_1D_KERNEL_LOOP(k, (size_t)rows * cols)
+		atomicMax(&row_max_bits[k / cols], __float_as_int(fabsf(__half2float(a[k]))));
+}
+
+// Pass 2: write INT8 activations (symmetric quantization to [-127, 127]) plus a
+// per-row FP16 scale.
+static __global__ void _ccv_nnc_gemm_i8_rowwrite(const half* const __restrict__ a, const int rows, const int cols, const int* const __restrict__ row_max_bits, int8_t* const __restrict__ a_q, __half* const __restrict__ a_scale)
+{
+	CUDA_1D_KERNEL_LOOP(k, (size_t)rows * cols)
+	{
+		const int row = k / cols;
+		const float m = __int_as_float(row_max_bits[row]);
+		const float inv = m > 0.f ? (127.f / m) : 1.f;
+		a_q[k] = (int8_t)__float2int_rn(__half2float(a[k]) * inv);
+		if (k % cols == 0)
+			a_scale[row] = __float2half(m > 0.f ? (m * (1.f / 127.f)) : 1.f);
+	}
+}
+
+// Epilogue: out[j][i] = C_int32[j][i] * a_scale[j] * w_scale[i] (+ bias[i]),
+// where j indexes activation rows and i indexes output features (cols).
+static __global__ void _ccv_nnc_gemm_i8_epilogue(const int* const __restrict__ c_i32, const __half* const __restrict__ a_scale, const __half* const __restrict__ w_scale, const __half* const __restrict__ bias, const int rows, const int cols, __half* const __restrict__ out)
+{
+	CUDA_1D_KERNEL_LOOP(o, (size_t)rows * cols)
+	{
+		const int j = o / cols;
+		const int i = o % cols;
+		float v = (float)c_i32[o] * __half2float(a_scale[j]) * __half2float(w_scale[i]);
+		if (bias)
+			v += __half2float(bias[i]);
+		out[o] = __float2half(v);
+	}
+}
+
 static inline void _ccv_nnc_gbmm_and_bias(cublasHandle_t cublas, const void* const ones, const unsigned char* const a, const int a_datatype, const int a_nd, const int* const adim, const int* const astride, const unsigned char* const w, const int w_datatype, const int w_nd, const int* const wdim, const int* const wstride, unsigned char* const bias, const int bias_datatype, const int bias_nd, const int* const biasdim, const int* const biasstride, unsigned char* const b, const int b_datatype, const int b_nd, const int* const bdim, const int* const bstride, const int b_batch_size, const cublasOperation_t transa, const cublasOperation_t transb, const int lda_inc, const int ldb_inc, const int a_batch_inc, const int w_batch_inc, const int bias_batch_inc, const int b_batch_inc, const int b_rows, const int b_cols, const int a_cols, const int bias_rows_inc, const int b_rows_inc, const int reduced_precision)
 {
 	static const half one_f16 = 1;
@@ -308,6 +380,80 @@ static int _ccv_nnc_gemm_forw(const ccv_nnc_cmd_t cmd, const ccv_nnc_hint_t hint
 		w_data_size = ccv_nnc_compat_qx_dense_data_size(w_params);
 	}
 	const size_t cublas_size = ccv_nnc_cublas_workspace_size_in_bytes(inputs, input_size, outputs, output_size);
+	// W8A8 INT8 GEMM path (opt-in, experimental): contiguous FP16 activation /
+	// output, q6p/q8p palette weight, large enough GEMM, and none of the
+	// transpose / batch / accumulate / downcast complications.  The dense weight
+	// is [out, in] row-major, so output features run along rows regardless of
+	// the GEMM's internal transpose flag.
+	const int w_subtype = CCV_GET_DATA_TYPE(w->info.datatype) == CCV_QX ? (w->info.datatype & 0xf00) : 0;
+	const int use_int8_gemm = _ccv_nnc_gemm_int8_enabled() &&
+		a_datatype == CCV_16F && w_datatype == CCV_16F && b->info.datatype == CCV_16F &&
+		(w_subtype == 0x600 || w_subtype == 0x800) &&
+		!transpose_a && !is_downcast && !(cmd.info.blas.flags & CCV_NNC_ACCUMULATE_OUTPUT) &&
+		a_batch_size == 1 && w_batch_size == 1 && b_batch_size == 1 &&
+		ccv_nnc_tensor_nd(a->info.dim) <= 2 && ccv_nnc_tensor_nd(w->info.dim) == 2 && ccv_nnc_tensor_nd(b->info.dim) <= 2 &&
+		CCV_IS_TENSOR_CONTIGUOUS(a) && CCV_IS_TENSOR_CONTIGUOUS(w) && CCV_IS_TENSOR_CONTIGUOUS(b) &&
+		(!bias || (bias->info.datatype == CCV_16F && CCV_IS_TENSOR_CONTIGUOUS(bias) && ccv_nnc_tensor_nd(bias->info.dim) == 1)) &&
+		// CUBLAS_COMPUTE_32I requires lda/ldb/ldc (the leading dimensions, in
+		// elements) to be multiples of 4: lda_inc = K or N, ldb_inc = K, ldc = N.
+		(a_cols % 4 == 0) && (b_cols % 4 == 0) &&
+		b_rows >= 8 && (uint64_t)a_cols * w_cols >= (uint64_t)_ccv_nnc_gemm_int8_min_tile();
+	if (use_int8_gemm)
+	{
+		cudaStream_t stream = ccv_nnc_stream_context_get_stream(stream_context);
+		const size_t a_count = (size_t)a_rows * a_cols; // M*K
+		const size_t w_count = (size_t)w_rows * w_cols; // K*N
+		const size_t b_count = (size_t)b_rows * b_cols; // M*N
+		// scratch layout: [cublas | a_i8(MK) | w_i8(KN) | c_i32(4MN) | a_scale(2M) | w_scale(2N) | row_max(4M)]
+		// each section is padded to a 4-byte boundary so the int32 buffers stay aligned.
+		size_t scratch_off = cublas_size;
+		const size_t scratch_size = cublas_size +
+			((a_count + 3) & ~(size_t)3) + ((w_count + 3) & ~(size_t)3) +
+			((b_count * 4 + 3) & ~(size_t)3) + ((a_rows * sizeof(__half) + 3) & ~(size_t)3) +
+			((w_cols * sizeof(__half) + 3) & ~(size_t)3) + ((a_rows * sizeof(int) + 3) & ~(size_t)3);
+		void* const scratch = ccv_nnc_stream_context_get_workspace(stream_context, scratch_size, CCV_TENSOR_GPU_MEMORY);
+		int8_t* const a_i8 = (int8_t*)((unsigned char*)scratch + scratch_off); scratch_off += (a_count + 3) & ~(size_t)3;
+		int8_t* const w_i8 = (int8_t*)((unsigned char*)scratch + scratch_off); scratch_off += (w_count + 3) & ~(size_t)3;
+		int* const c_i32 = (int*)((unsigned char*)scratch + scratch_off); scratch_off += (b_count * 4 + 3) & ~(size_t)3;
+		__half* const a_scale = (__half*)((unsigned char*)scratch + scratch_off); scratch_off += (a_rows * sizeof(__half) + 3) & ~(size_t)3;
+		__half* const w_scale = (__half*)((unsigned char*)scratch + scratch_off); scratch_off += (w_cols * sizeof(__half) + 3) & ~(size_t)3;
+		int* const row_max = (int*)((unsigned char*)scratch + scratch_off);
+		ccv_nnc_tensor_param_t w_params = w->info;
+		// Decode q6p/q8p palette weight straight to INT8 (1 byte/element) plus a
+		// per-output-feature FP16 scale.  The dense weight is [K(in), N(out)]
+		// row-major when transa=OP_N (transpose_w=0) and [N(out), K(in)] when
+		// transa=OP_T (transpose_w=1); output features run along columns in the
+		// former and along rows in the latter, so scale_along_rows follows
+		// transpose_w.  row_len is the physical row width (dim[1]) either way.
+		if (ccv_nnc_compat_decode_qx_int8_colwise(w->data.u8, w_params, w_i8, w_scale, w_params.dim[1], transpose_w != 0, stream_context) == 0)
+		{
+			CUDA_ENFORCE(cudaMemsetAsync(row_max, 0, (size_t)a_rows * sizeof(int), stream));
+			_ccv_nnc_gemm_i8_rowmax<<<CUDA_GET_BLOCKS(a_count), CUDA_NUM_THREADS, 0, stream>>>((const half*)a->data.f16, a_rows, a_cols, row_max);
+			_ccv_nnc_gemm_i8_rowwrite<<<CUDA_GET_BLOCKS(a_count), CUDA_NUM_THREADS, 0, stream>>>((const half*)a->data.f16, a_rows, a_cols, row_max, a_i8, a_scale);
+			cublasHandle_t cublas = ccv_nnc_stream_context_get_cublas(stream_context);
+			ccv_nnc_stream_context_set_cublas_workspace(cublas, stream_context, cublas_size);
+			static const int one_i32 = 1;
+			static const int zero_i32 = 0;
+			CUBLAS_ENFORCE(cublasGemmEx(cublas, transa, transb, b_cols, b_rows, a_cols, &one_i32, w_i8, CUDA_R_8I, lda_inc, a_i8, CUDA_R_8I, ldb_inc, &zero_i32, c_i32, CUDA_R_32I, b_rows_inc, CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+			_ccv_nnc_gemm_i8_epilogue<<<CUDA_GET_BLOCKS(b_count), CUDA_NUM_THREADS, 0, stream>>>(c_i32, a_scale, w_scale, bias ? (const __half*)bias->data.f16 : 0, b_rows, b_cols, (__half*)b->data.f16);
+			{
+				static int s_diag = 0;
+				static int s_diag_call = -1;
+				if (!s_diag)
+				{
+					s_diag = 1;
+					fprintf(stderr, "[GEMM-DIAG] INT8 GEMM path enabled (CCV_GEMM_INT8=1)\n");
+					const char* const v = getenv("CCV_GEMM_INT8_DIAG");
+					s_diag_call = v ? (atoi(v) != 0) : 0;
+				}
+				if (s_diag_call)
+					fprintf(stderr, "[GEMM-DIAG] INT8 GEMM: M=%d K=%d N=%d qbits=%d\n", b_rows, a_cols, b_cols, (w_params.datatype >> 8) & 0xf);
+			}
+			return CCV_NNC_EXEC_SUCCESS;
+		}
+		// decode returned nonzero (unexpected with the q6p/q8p gate) -> fall
+		// through to the regular FP16 decode path below.
+	}
 	void* workspace = 0;
 	if (a_data_size + w_data_size > 0)
 		workspace = ccv_nnc_stream_context_get_workspace(stream_context, cublas_size + a_data_size + w_data_size, CCV_TENSOR_GPU_MEMORY);

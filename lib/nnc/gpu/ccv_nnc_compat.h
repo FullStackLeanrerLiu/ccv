@@ -66,6 +66,11 @@ void ccv_nnc_compat_depalettize(const void* input, const int datatype, const siz
 void ccv_nnc_compat_dequantize_8i_rowwise(const void* input, const int datatype, const size_t input_length, const size_t row_length, void* output, const size_t output_length, ccv_nnc_stream_context_t* const stream_context);
 void ccv_nnc_compat_dequantize_8i_rowwise_x_fp(const void* input, const int datatype, const size_t input_length, const size_t row_length, const int format, void* output, const size_t output_length, ccv_nnc_stream_context_t* const stream_context);
 void ccv_nnc_compat_decode_qx(const void* input, const ccv_nnc_tensor_param_t params, void* output, ccv_nnc_stream_context_t* const stream_context);
+// W8A8 (INT8 GEMM) path: decode a CCV_QX palette tensor (q6p/q8p) into an INT8
+// buffer plus one FP16 scale per output-feature column (axis chosen by
+// scale_along_rows). Returns 0 on success, nonzero if the format is not
+// supported (caller should fall back to the FP16 decode path).
+int ccv_nnc_compat_decode_qx_int8_colwise(const void* input, const ccv_nnc_tensor_param_t params, void* output_i8, void* output_scale, const size_t row_len, const bool scale_along_rows, ccv_nnc_stream_context_t* const stream_context);
 void ccv_nnc_tensor_prefetch_async(ccv_nnc_tensor_t* const tensor, const ccv_nnc_stream_context_t* const stream_context);
 #ifdef __cplusplus
 }

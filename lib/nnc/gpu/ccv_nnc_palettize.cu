@@ -1189,3 +1189,110 @@ void ccv_nnc_compat_decode_qx(const void* input, const ccv_nnc_tensor_param_t pa
 		assert(0);
 	}
 }
+
+// ---- W8A8 INT8 GEMM decode: q6p/q8p palette -> int8 + per-column fp16 scale ----
+//
+// Two passes: pass 1 computes max |palette value| per output-feature column
+// (float bits are monotonically ordered for non-negative floats, so a plain
+// atomicMax on __float_as_int(fabsf(v)) works, init 0).  Pass 2 writes the
+// INT8 values (symmetric quantization to [-127, 127]) and one FP16 scale per
+// column.  scale_along_rows selects whether the output-feature axis runs along
+// rows (transposed weight layout) or columns of the decoded row-major array.
+
+template<int QBITS>
+__global__ void _ccv_nnc_qx_int8_col_max(const uint8_t* const a, const size_t count, const size_t row_len, const bool scale_along_rows, const int number_in_blocks, int* const col_max_bits)
+{
+	const int palette_count = QBITS == 6 ? 64 : 256;
+	const int index_bytes = QBITS == 6 ? (number_in_blocks / 4) * 3 : number_in_blocks;
+	CUDA_1D_KERNEL_LOOP(k, count) {
+		const int block_idx = (int)(k / number_in_blocks);
+		const int j = (int)(k % number_in_blocks);
+		const uint8_t* const ui0 = a + (size_t)(sizeof(__half) * palette_count + index_bytes) * block_idx;
+		const __half* const palette = (const __half*)ui0;
+		const uint8_t* const ui1 = ui0 + sizeof(__half) * palette_count;
+		float v;
+		if (QBITS == 6) {
+			const uint8_t u0 = ui1[(j / 4) * 3];
+			const uint8_t u1b = ui1[(j / 4) * 3 + 1];
+			const uint8_t u2 = ui1[(j / 4) * 3 + 2];
+			const int slot = j % 4;
+			int idx;
+			if (slot == 0) idx = (int)(u0 >> 2);
+			else if (slot == 1) idx = (int)(((u0 & 3) << 4) | (u1b >> 4));
+			else if (slot == 2) idx = (int)(((u1b & 15) << 2) | (u2 >> 6));
+			else idx = (int)(u2 & 63);
+			v = __half2float(palette[idx]);
+		} else {
+			v = __half2float(palette[ui1[j]]);
+		}
+		const int row = (int)(k / row_len);
+		const int col = (int)(k % row_len);
+		const int sidx = scale_along_rows ? row : col;
+		atomicMax(&col_max_bits[sidx], __float_as_int(fabsf(v)));
+	}
+}
+
+template<int QBITS>
+__global__ void _ccv_nnc_qx_int8_col_write(const uint8_t* const a, const size_t count, const size_t row_len, const bool scale_along_rows, const int number_in_blocks, const int* const col_max_bits, int8_t* const out, __half* const out_scale)
+{
+	const int palette_count = QBITS == 6 ? 64 : 256;
+	const int index_bytes = QBITS == 6 ? (number_in_blocks / 4) * 3 : number_in_blocks;
+	CUDA_1D_KERNEL_LOOP(k, count) {
+		const int block_idx = (int)(k / number_in_blocks);
+		const int j = (int)(k % number_in_blocks);
+		const uint8_t* const ui0 = a + (size_t)(sizeof(__half) * palette_count + index_bytes) * block_idx;
+		const __half* const palette = (const __half*)ui0;
+		const uint8_t* const ui1 = ui0 + sizeof(__half) * palette_count;
+		float v;
+		if (QBITS == 6) {
+			const uint8_t u0 = ui1[(j / 4) * 3];
+			const uint8_t u1b = ui1[(j / 4) * 3 + 1];
+			const uint8_t u2 = ui1[(j / 4) * 3 + 2];
+			const int slot = j % 4;
+			int idx;
+			if (slot == 0) idx = (int)(u0 >> 2);
+			else if (slot == 1) idx = (int)(((u0 & 3) << 4) | (u1b >> 4));
+			else if (slot == 2) idx = (int)(((u1b & 15) << 2) | (u2 >> 6));
+			else idx = (int)(u2 & 63);
+			v = __half2float(palette[idx]);
+		} else {
+			v = __half2float(palette[ui1[j]]);
+		}
+		const int row = (int)(k / row_len);
+		const int col = (int)(k % row_len);
+		const int sidx = scale_along_rows ? row : col;
+		const float m = __int_as_float(col_max_bits[sidx]);
+		const float inv = m > 0.f ? (127.f / m) : 1.f;
+		out[k] = (int8_t)__float2int_rn(v * inv);
+		if (scale_along_rows ? (col == 0) : (row == 0))
+			out_scale[sidx] = __float2half(m > 0.f ? (m * (1.f / 127.f)) : 1.f);
+	}
+}
+
+int ccv_nnc_compat_decode_qx_int8_colwise(const void* input, const ccv_nnc_tensor_param_t params, void* output_i8, void* output_scale, const size_t row_len, const bool scale_along_rows, ccv_nnc_stream_context_t* const stream_context)
+{
+	assert(CCV_GET_DATA_TYPE(params.datatype) == CCV_QX);
+	const int subtype = params.datatype & 0xf00;
+	const int qbits = subtype >> 8;
+	if (qbits != 6 && qbits != 8)
+		return -1;  // only q6p/q8p palettes supported for the INT8 path
+	const size_t count = ccv_nnc_tensor_count(params);
+	const int number_in_blocks = params.reserved;
+	// q6 packs 4 six-bit indices into 3 bytes, so a non-multiple-of-4 block size
+	// cannot be decoded; q8 needs a valid block size.  Bail out (caller falls
+	// back to the FP16 decode path) rather than producing wrong results.
+	if (number_in_blocks <= 0 || (qbits == 6 && (number_in_blocks % 4 != 0 || count % number_in_blocks != 0)) || (qbits == 8 && count % number_in_blocks != 0))
+		return -1;
+	const size_t col_count = scale_along_rows ? ((count + row_len - 1) / row_len) : row_len;
+	cudaStream_t stream = ccv_nnc_stream_context_get_stream(stream_context);
+	int* const col_max_bits = (int*)ccv_nnc_stream_context_get_workspace(stream_context, col_count * sizeof(int), CCV_TENSOR_GPU_MEMORY);
+	CUDA_ENFORCE(cudaMemsetAsync(col_max_bits, 0, col_count * sizeof(int), stream));
+	if (qbits == 6) {
+		_ccv_nnc_qx_int8_col_max<6><<<CUDA_GET_BLOCKS(count), CUDA_NUM_THREADS, 0, stream>>>(input, count, row_len, scale_along_rows, number_in_blocks, col_max_bits);
+		_ccv_nnc_qx_int8_col_write<6><<<CUDA_GET_BLOCKS(count), CUDA_NUM_THREADS, 0, stream>>>(input, count, row_len, scale_along_rows, number_in_blocks, col_max_bits, (int8_t*)output_i8, (__half*)output_scale);
+	} else {
+		_ccv_nnc_qx_int8_col_max<8><<<CUDA_GET_BLOCKS(count), CUDA_NUM_THREADS, 0, stream>>>(input, count, row_len, scale_along_rows, number_in_blocks, col_max_bits);
+		_ccv_nnc_qx_int8_col_write<8><<<CUDA_GET_BLOCKS(count), CUDA_NUM_THREADS, 0, stream>>>(input, count, row_len, scale_along_rows, number_in_blocks, col_max_bits, (int8_t*)output_i8, (__half*)output_scale);
+	}
+	return 0;
+}

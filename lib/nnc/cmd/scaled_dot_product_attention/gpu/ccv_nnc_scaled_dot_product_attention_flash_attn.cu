@@ -269,6 +269,7 @@ static int _ccv_nnc_scaled_dot_product_attention_forw(const ccv_nnc_cmd_t cmd, c
 		props.major == 7 && props.minor == 5 && !is_varlen;
 	if (sm75_qk_eligible) {
 		static int sm75_qk_mode = -1;
+		static int sm75_qk_min_tile = 0;
 		if (sm75_qk_mode < 0) {
 			const char* const qk_mode = getenv("CCV_QK_MODE");
 			if (qk_mode && strcmp(qk_mode, "int8") == 0)
@@ -279,8 +280,35 @@ static int _ccv_nnc_scaled_dot_product_attention_forw(const ccv_nnc_cmd_t cmd, c
 				sm75_qk_mode = 3;  // force standard FP16 (no quantized QK)
 			else
 				sm75_qk_mode = 0;  // auto => standard FP16 fused path
+			// SIZE GATE (CCV_QK_MIN_TILE, default 16384 = 128 x 128):
+			// quantized QK only pays off on large attention tiles — long
+			// sequences (text encoders with image tokens) or full-sequence DiT
+			// attention. Small tiles (e.g. window attention, low-res patches)
+			// keep the standard FP16 path: the fixed quantize/dequant + smem
+			// overhead exceeds the INT8/INT4 MMA gain there, and the INT8 path
+			// has historically produced artifacts on tiny (32 x 32) tiles.
+			const char* const min_tile = getenv("CCV_QK_MIN_TILE");
+			sm75_qk_min_tile = min_tile ? atoi(min_tile) : 16384;
 		}
+		// SEQUENCE-LENGTH ROUTER (CCV_QK_ROUTE, default 0 / off): an explicit A/B
+		// knob that picks the INT8-QK path per attention extent (R*C = seqlen_q x
+		// seqlen_k).  It does not add a new kernel — it only decides whether the
+		// existing quantized-QK path should engage — and is fully orthogonal to the
+		// CCV_QK_MODE / CCV_QK_MIN_TILE gates above.  When enabled:
+		//   R*C <= 128   -> keep the standard FP16 fused path (fixed quantize /
+		//                    dequant + smem overhead outruns the INT8 MMA gain, and
+		//                    tiny 32x32 tiles have historically produced artifacts)
+		//   R*C >  128   -> engage INT8-QK (large attention extent stretches the
+		//                    INT8 m8n8k16 tensor-core advantage).
+		static int sm75_qk_route = -1;
+		if (sm75_qk_route < 0) {
+			const char* const r = getenv("CCV_QK_ROUTE");
+			sm75_qk_route = r && atoi(r) != 0 ? 1 : 0;
+		}
+		const bool sm75_route_enabled = (sm75_qk_route != 0);
+		const bool sm75_route_large = (uint64_t)R * C > (uint64_t)128;
 		params.num_splits = 1;  // quantized-QK fused kernel is non-split only
+		const bool qk_tile_large_enough = (uint64_t)R * C >= (uint64_t)sm75_qk_min_tile;
 		if (sm75_qk_mode == 0) {
 			// auto (default): standard FP16 fused path.  The quantized-QK paths
 			// are experimental on Turing; engage them only when explicitly named.
@@ -288,15 +316,26 @@ static int _ccv_nnc_scaled_dot_product_attention_forw(const ccv_nnc_cmd_t cmd, c
 			// deliberately ask for a quantized attention can get one.
 			const bool want_int8 = (cmd.info.scaled_dot_product_attention.flags & CCV_NNC_GEMM_8I) != 0;
 			const bool want_int4 = (cmd.info.scaled_dot_product_attention.flags & CCV_NNC_GEMM_4I) != 0;
-			if (want_int4)
-				params.is_int4qk = true;
-			else if (want_int8)
-				params.is_int8qk = true;
+			if (qk_tile_large_enough) {
+				if (want_int4)
+					params.is_int4qk = true;
+				else if (want_int8)
+					params.is_int8qk = true;
+			}
 		} else if (sm75_qk_mode == 1) {
-			params.is_int8qk = true;  // experimental INT8-QK
+			if (qk_tile_large_enough)
+				params.is_int8qk = true;  // experimental INT8-QK, large tiles only
 		} else if (sm75_qk_mode == 2) {
-			params.is_int4qk = true;  // experimental INT4-QK
+			if (qk_tile_large_enough)
+				params.is_int4qk = true;  // experimental INT4-QK, large tiles only
 		}  // mode == 3 or auto => plain FP16 fused path, both flags stay false.
+		// CCV_QK_ROUTE override: when enabled it supersedes the mode/gate decision
+		// above and drives the INT8-QK path purely off the sequence extent (large =>
+		// INT8, small => FP16).  Default off keeps the existing behavior untouched.
+		if (sm75_route_enabled) {
+			params.is_int4qk = false;
+			params.is_int8qk = sm75_route_large;
+		}
 		// fp16-SageAttention tile variant — only when no quantized path was
 		// explicitly requested.
 		static int sm75_sega_mode = -1;
@@ -334,8 +373,14 @@ static int _ccv_nnc_scaled_dot_product_attention_forw(const ccv_nnc_cmd_t cmd, c
 		static bool s_diag2 = false;
 		if (!s_diag2) {
 			s_diag2 = true;
+#ifdef HAVE_CUDA_SM75
+			fprintf(stderr, "[SDPA-DIAG] dispatch: int8=%d int4=%d sega_fp16=%d splits=%d D=%d bf16=%d R=%d C=%d qk_min_tile=%d tile_large=%d\n",
+				(int)params.is_int8qk, (int)params.is_int4qk, (int)params.is_sega_fp16, params.num_splits, D, (int)params.is_bf16,
+				R, C, sm75_qk_eligible ? sm75_qk_min_tile : 0, sm75_qk_eligible ? (int)qk_tile_large_enough : 0);
+#else
 			fprintf(stderr, "[SDPA-DIAG] dispatch: int8=%d int4=%d sega_fp16=%d splits=%d D=%d bf16=%d\n",
 				(int)params.is_int8qk, (int)params.is_int4qk, (int)params.is_sega_fp16, params.num_splits, D, (int)params.is_bf16);
+#endif
 		}
 	}
 	// --- END DIAG(2) ---

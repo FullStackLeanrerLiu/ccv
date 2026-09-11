@@ -69,7 +69,8 @@ constexpr float kInt8Range = 127.f;
 template<int kBlockM, int kBlockN, int kHeadDim, int kNWarps>
 __device__ __forceinline__ void int8_cute_bypass_gemm(
     int8_t const* __restrict__ sQ8, int8_t const* __restrict__ sK8,
-    float* __restrict__ sR, const float score_scale, const int tidx) {
+    float* __restrict__ sR, float const* __restrict__ sQsc, float const* __restrict__ sKsc,
+    const int tidx) {
     static_assert(kBlockM % 8 == 0, "kBlockM must be a multiple of 8");
     static_assert(kBlockN % 8 == 0, "kBlockN must be a multiple of 8");
     static_assert(kHeadDim % 16 == 0, "kHeadDim must be a multiple of 16");
@@ -94,30 +95,30 @@ __device__ __forceinline__ void int8_cute_bypass_gemm(
                     : "+r"(acc0), "+r"(acc1)
                     : "r"(a0), "r"(b0));
             }
-            // Dequantize and spill to the row-major fp32 score tile.
+            // Dequantize (per output row/col scales) and spill to sR.
             const int row = mb + m8;
             const int col = nb * 8 + kgrp * 2;
-            sR[row * kBlockN + col]     = (float)acc0 * score_scale;
-            sR[row * kBlockN + col + 1] = (float)acc1 * score_scale;
+            const float scl = sQsc[row] * sKsc[nb * 8 + m8];
+            sR[row * kBlockN + col]     = (float)acc0 * scl;
+            sR[row * kBlockN + col + 1] = (float)acc1 * scl;
         }
     }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-// Dynamic per-block INT8 quantization of a tile in shared-memory.
+// Dynamic per-row INT8 quantization of a tile in shared-memory.
 //
-// One scale is computed for the whole (nRows x HeadDim) tile: a block-wide
-// absmax reduced over all kNThreads threads (warp shuffles + a 1-float smem
-// fold), then scale = absmax / 127 and Q = round(fp16 * 127 / absmax) clamped
-// to [-128, 127] are written.  This mirrors the per_block_int8 granularity of
-// the community SageAttention sm75 path (one scale per BLK x D block, with
-// BLK = kBlockM / kBlockN here) and removes the per-row scale array + per-row
-// divisions of the previous implementation.
+// Each thread owns one (or when there are more threads than rows, a subset of
+// the) whole row.  For every row it computes the absmax over the full head
+// dimension, derives scale = absmax / 127 (guarding the all-zero row to 1.0),
+// stores the *forward* scale (used later to dequantize the int32 score) into
+// `scale_out` (kBlockM / kBlockN floats), and writes Q = round(fp16 * 127 /
+// absmax) clamped to [-128, 127] into the destination tile.
 //
-// `scale_out` points at a 2-float smem slot: [0] = scale (absmax/127, or 1.0
-// for a silent tile), [1] = recip (127/absmax, 0 for a silent tile).  The
-// scale pair is written by thread 0 after a block reduction; the trailing
-// __syncthreads() makes it visible to all threads before conversion.
+// Per-row scales keep an outlier in one row of Q/K from compressing the other
+// rows' 8-bit codes — the coarse whole-tile scale previously collapsed the
+// dynamic range and produced blocky / corrupted attention (the "block artifacts"
+// seen on 2080 Ti).  This mirrors the working INT4-QK path (per-row scales).
 //
 // `s` may be any (possibly swizzled) FP16 smem tensor; only `s8` is assumed
 // plain row-major.
@@ -125,39 +126,20 @@ __device__ __forceinline__ void int8_cute_bypass_gemm(
 template<int nRows, int HeadDim, int kNThreads, typename F16Tensor>
 __device__ __forceinline__ void int8_quantize_block(F16Tensor const& s, int8_t* __restrict__ s8,
                                                     float* __restrict__ scale_out) {
-    // ---- 1) block-wide absmax over all nRows x HeadDim elements ----
-    float local = 0.f;
     #pragma unroll 1
-    for (int r = 0; r < nRows; ++r) {
-        #pragma unroll 1
-        for (int j = threadIdx.x; j < HeadDim; j += kNThreads) {
-            const float v = (float)s(r, j);
-            local = fmaxf(local, fabsf(v));
-        }
-    }
-    #pragma unroll
-    for (int off = 16; off > 0; off >>= 1)
-        local = fmaxf(local, __shfl_xor_sync(0xffffffffu, local, off));
-    __shared__ float warp_amax[8];  // kNThreads/32 <= 8 warps for all instantiations
-    if ((threadIdx.x & 31) == 0) { warp_amax[threadIdx.x >> 5] = local; }
-    __syncthreads();
-    if (threadIdx.x == 0) {
+    for (int r = threadIdx.x; r < nRows; r += kNThreads) {
         float amax = 0.f;
-        #pragma unroll
-        for (int w = 0; w < kNThreads / 32; ++w) { amax = fmaxf(amax, warp_amax[w]); }
-        const bool has_signal = amax > 1e-12f;
-        scale_out[0] = has_signal ? amax / kInt8Range : 1.f;  // scale
-        scale_out[1] = has_signal ? kInt8Range / amax : 0.f;  // recip = 127 / absmax
-    }
-    __syncthreads();
-
-    // ---- 2) convert + store using the broadcast [scale, recip] pair ----
-    const float inv = scale_out[1];
-    #pragma unroll 1
-    for (int r = 0; r < nRows; ++r) {
+        #pragma unroll 1
+        for (int j = 0; j < HeadDim; ++j) {
+            const float v = (float)s(r, j);
+            amax = fmaxf(amax, fabsf(v));
+        }
+        const float scale = amax > 1e-12f ? amax / kInt8Range : 1.f;
+        const float inv = amax > 1e-12f ? kInt8Range / amax : 0.f;
+        scale_out[r] = scale;   // forward scale for dequant: score = acc * sQsc[row] * sKsc[col]
         int8_t* const row8 = s8 + r * HeadDim;
         #pragma unroll 1
-        for (int j = threadIdx.x; j < HeadDim; j += kNThreads) {
+        for (int j = 0; j < HeadDim; ++j) {
             const float v = (float)s(r, j) * inv;
             int vi = (int)(v < 0.f ? v - 0.5f : v + 0.5f);
             vi = vi < -128 ? -128 : (vi > 127 ? 127 : vi);
@@ -277,8 +259,8 @@ inline __device__ void compute_attn_int8_1rowblock(const Params &params, const i
     int8_t* const sQ8ptr = reinterpret_cast<int8_t*>(smem_) + Kernel_traits::Base::kSmemSize;
     int8_t* const sK8ptr = sQ8ptr + Kernel_traits::kSmemQ8Size;
     float*  const sQsc  = reinterpret_cast<float*>(sK8ptr + Kernel_traits::kSmemK8Size);
-    float*  const sKsc  = sQsc + 2;   // [scale, recip] per tile (2 floats each)
-    float*  const sRptr = sKsc + 2;
+    float*  const sKsc  = sQsc + kBlockM;   // per-row forward scales [kBlockM] + [kBlockN]
+    float*  const sRptr = sKsc + kBlockN;
     Tensor sR  = make_tensor(make_smem_ptr(sRptr),  typename Kernel_traits::ScoresSmemLayout{});
 
     typename Kernel_traits::GmemTiledCopyQKV gmem_tiled_copy_QKV;
@@ -327,11 +309,10 @@ inline __device__ void compute_attn_int8_1rowblock(const Params &params, const i
                                        binfo.actual_seqlen_q - m_block * kBlockM);
     if (!Is_even_K) { __syncthreads(); }
 
-    // Quantize Q to int8 once (per-block scale is constant across all K blocks).
+    // Quantize Q to int8 once (per-row scales, constant across all K blocks).
     __syncthreads();
     flash::int8_quantize_block<kBlockM, kHeadDim, kNThreads>(sQ, sQ8ptr, sQsc);
     __syncthreads();
-    const float sQscale = sQsc[0];   // per-block Q scale (registers after sync)
 
     int n_block = n_block_max - 1;
     flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block), tKsK, tKVcKV, tKVpKV,
@@ -369,12 +350,11 @@ inline __device__ void compute_attn_int8_1rowblock(const Params &params, const i
         // ---------------- INT8-QK stage ----------------
         flash::int8_quantize_block<kBlockN, kHeadDim, kNThreads>(sK, sK8ptr, sKsc);
         __syncthreads();
-        const float score_scale = sQscale * sKsc[0];   // per-block dequant scale
 
         // Hand-written m8n8k16 GEMM: uint32_t manual loads from the plain
-        // row-major int8 smem tiles, dequant + spill straight into sR.
+        // row-major int8 smem tiles, per-(row,col) dequant + spill to sR.
         flash::int8_cute_bypass_gemm<kBlockM, kBlockN, kHeadDim, kNWarps>(
-            sQ8ptr, sK8ptr, sRptr, score_scale, tidx
+            sQ8ptr, sK8ptr, sRptr, sQsc, sKsc, tidx
         );
         __syncthreads();
         if (n_block > n_block_min) {
@@ -432,12 +412,11 @@ inline __device__ void compute_attn_int8_1rowblock(const Params &params, const i
         // ---------------- INT8-QK stage ----------------
         flash::int8_quantize_block<kBlockN, kHeadDim, kNThreads>(sK, sK8ptr, sKsc);
         __syncthreads();
-        const float score_scale = sQscale * sKsc[0];   // per-block dequant scale
 
         // Hand-written m8n8k16 GEMM: uint32_t manual loads from the plain
-        // row-major int8 smem tiles, dequant + spill straight into sR.
+        // row-major int8 smem tiles, per-(row,col) dequant + spill to sR.
         flash::int8_cute_bypass_gemm<kBlockM, kBlockN, kHeadDim, kNWarps>(
-            sQ8ptr, sK8ptr, sRptr, score_scale, tidx
+            sQ8ptr, sK8ptr, sRptr, sQsc, sKsc, tidx
         );
         __syncthreads();
 

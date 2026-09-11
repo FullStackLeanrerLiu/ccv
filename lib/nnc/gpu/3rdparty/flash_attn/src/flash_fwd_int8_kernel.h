@@ -96,11 +96,15 @@ __device__ __forceinline__ void int8_cute_bypass_gemm(
                     : "r"(a0), "r"(b0));
             }
             // Dequantize (per output row/col scales) and spill to sR.
+            // mma.m8n8k16 C-fragment: this thread owns C(m8, kgrp*2) and C(m8, kgrp*2+1),
+            // so the two int32 accumulators correspond to two *distinct* K rows (N dim),
+            // each with its own per-row K scale. Per-row Q scale is uniform here (sclq).
             const int row = mb + m8;
-            const int col = nb * 8 + kgrp * 2;
-            const float scl = sQsc[row] * sKsc[nb * 8 + m8];
-            sR[row * kBlockN + col]     = (float)acc0 * scl;
-            sR[row * kBlockN + col + 1] = (float)acc1 * scl;
+            const int c0 = nb * 8 + kgrp * 2;    // K token (N/col) for acc0
+            const int c1 = c0 + 1;               // K token (N/col) for acc1
+            const float sclq = sQsc[row];
+            sR[row * kBlockN + c0] = (float)acc0 * (sclq * sKsc[c0]);
+            sR[row * kBlockN + c1] = (float)acc1 * (sclq * sKsc[c1]);
         }
     }
 }
